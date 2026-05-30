@@ -43,37 +43,48 @@ INSERT INTO doctors (id, name, specialization, qualification, experience, phone,
 ('doc_004', 'Dr. Karan Malhotra', 'Orthopedics',      'MBBS, MS (Orthopedics)',        10, '+91-9000000004', 'karan.malhotra@healthapi.com',ARRAY['Monday','Wednesday','Friday'],                              700.00, 'on_leave');
 
 -- ── PATIENTS ─────────────────────────────────────────────────
-INSERT INTO patients (id, first_name, last_name, date_of_birth, age, gender, blood_group, phone, email,
+INSERT INTO patients (
+  id, first_name, last_name, date_of_birth, age, gender, blood_group, phone, email,
   street, city, state, pincode, emergency_name, emergency_relation, emergency_phone,
-  medical_history, allergies, current_medications, insurance_id, status, admitted_at) VALUES
+  medical_history, allergies, current_medications, insurance_id, status, admitted_at
+) VALUES
 (
   'pat_001','Rohan','Sharma','1990-04-15',34,'male','O+','+91-9876543210','rohan.sharma@email.com',
   '12 MG Road','Mumbai','Maharashtra','400001','Anjali Sharma','Spouse','+91-9876543211',
-  ARRAY['Hypertension','Type 2 Diabetes'],ARRAY['Penicillin'],ARRAY['Metformin 500mg','Amlodipine 5mg'],
+  ARRAY['Hypertension','Type 2 Diabetes'],
+  ARRAY['Penicillin'],
+  ARRAY['Metformin 500mg','Amlodipine 5mg'],
   'INS-MH-2024-001','active',NULL
 ),
 (
   'pat_002','Priya','Patel','1985-07-22',39,'female','A+','+91-9123456789','priya.patel@email.com',
   '45 Park Street','Pune','Maharashtra','411001','Raj Patel','Husband','+91-9123456790',
-  ARRAY['Asthma'],ARRAY['Aspirin','Sulfa drugs'],ARRAY['Salbutamol inhaler'],
+  ARRAY['Asthma'],
+  ARRAY['Aspirin','Sulfa drugs'],
+  ARRAY['Salbutamol inhaler'],
   'INS-MH-2024-002','active','2025-01-20T08:00:00Z'
 ),
 (
   'pat_003','Arjun','Nair','1978-11-30',46,'male','B-','+91-9988776655','arjun.nair@email.com',
   '7 Lakeview Colony','Nagpur','Maharashtra','440001','Deepa Nair','Wife','+91-9988776656',
-  ARRAY['Chronic Kidney Disease Stage 2'],ARRAY[],ARRAY['Losartan 50mg','Vitamin D3'],
+  ARRAY['Chronic Kidney Disease Stage 2'],
+  ARRAY[]::TEXT[],
+  ARRAY['Losartan 50mg','Vitamin D3'],
   'INS-MH-2024-003','inactive',NULL
 ),
 (
   'pat_004','Sneha','Kulkarni','2000-03-08',25,'female','AB+','+91-9765432109','sneha.kulkarni@email.com',
   '3 Rose Garden','Nashik','Maharashtra','422001','Suresh Kulkarni','Father','+91-9765432100',
-  ARRAY[],ARRAY['Latex'],ARRAY[],
+  ARRAY[]::TEXT[],
+  ARRAY['Latex'],
+  ARRAY[]::TEXT[],
   'INS-MH-2024-004','active',NULL
 ),
 (
   'pat_005','Vikram','Desai','1965-09-14',59,'male','O-','+91-9654321098','vikram.desai@email.com',
   '22 Shivaji Nagar','Aurangabad','Maharashtra','431001','Meena Desai','Wife','+91-9654321099',
-  ARRAY['Coronary Artery Disease','Hypertension','Hyperlipidemia'],ARRAY['Codeine'],
+  ARRAY['Coronary Artery Disease','Hypertension','Hyperlipidemia'],
+  ARRAY['Codeine'],
   ARRAY['Atorvastatin 40mg','Aspirin 75mg','Bisoprolol 5mg'],
   'INS-MH-2024-005','active','2025-01-18T07:30:00Z'
 );
