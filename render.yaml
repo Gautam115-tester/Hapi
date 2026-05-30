@@ -1,0 +1,43 @@
+# render.yaml — Render.com deployment configuration
+# Commit this file to your repo root. Render auto-detects it.
+
+services:
+  - type: web
+    name: healthapi
+    runtime: node
+    plan: free           # upgrade to starter/standard for production
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000     # Render uses 10000 internally; maps to 443 externally
+      - key: BASE_URL
+        fromService:
+          type: web
+          name: healthapi
+          property: host
+          format: https://{host}
+
+      # ── Set these in Render Dashboard → Environment ──────────
+      # DO NOT put real values here — this file is committed to git
+      - key: SUPABASE_URL
+        sync: false      # Render will prompt you to set this
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true   # Render auto-generates a random value
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: OAUTH_ACCESS_TOKEN_TTL
+        value: "3600"
+      - key: OAUTH_REFRESH_TOKEN_TTL
+        value: "604800"
+      - key: OAUTH_AUTH_CODE_TTL
+        value: "300"
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "900000"
+      - key: RATE_LIMIT_MAX
+        value: "200"
