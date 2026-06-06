@@ -1,12 +1,13 @@
 // src/controllers/authController.js
 // ============================================================
-//  Authentication Controller — Production-grade
-//  - Proper bcrypt verification (no plaintext fallback in prod)
+//  Authentication Controller
+//  - bcrypt verification
 //  - JWT with full RFC 7519 claims (iss, sub, aud, jti, iat, exp)
 //  - Refresh token rotation with replay detection
-//  - Brute-force / lockout protection
+//  - Brute-force / lockout protection (email-only, no IP)
 //  - Full audit trail
 //  - WWW-Authenticate headers on all 401s
+//  - clear-lockout endpoint for teaching/testing use
 // ============================================================
 
 const jwt     = require('jsonwebtoken');
@@ -25,6 +26,7 @@ const { success, error } = require('../utils/response');
 const {
   audit, AUDIT_EVENTS,
   recordFailure, isLocked, clearFailures,
+  clearAllFailures, getLockoutStatus,
   createFamily, addToFamily, isTokenReused, revokeFamilyOnReuse,
   generateJti, wwwAuthenticate, getClientIp, getAuditLog,
 } = require('../utils/authSecurity');
@@ -33,17 +35,6 @@ const {
 const ISSUER   = BASE_URL || 'https://healthapi.onrender.com';
 const AUDIENCE = 'healthapi-clients';
 
-/**
- * Build a signed access token with full RFC 7519 + custom claims.
- * Claims:
- *   iss  — issuer (BASE_URL)
- *   sub  — subject (user.id)
- *   aud  — audience
- *   jti  — unique token ID (enables per-token revocation)
- *   iat  — issued-at
- *   exp  — expiry
- *   name / email / role / department — app claims
- */
 const signAccessToken = (user, additionalClaims = {}) => {
   const jti = generateJti();
   return {
@@ -69,11 +60,6 @@ const signAccessToken = (user, additionalClaims = {}) => {
   };
 };
 
-/**
- * Build a refresh token.  Embeds a familyId so we can detect reuse attacks.
- * The familyId travels with every rotation so we can nuke the entire family
- * if a previously-consumed token is presented again.
- */
 const signRefreshToken = (user, familyId) =>
   jwt.sign(
     { sub: user.id, familyId },
@@ -81,7 +67,6 @@ const signRefreshToken = (user, familyId) =>
     { expiresIn: JWT_REFRESH_EXPIRES_IN, issuer: ISSUER, algorithm: 'HS256' }
   );
 
-// ── Token expiry in ms ────────────────────────────────────────
 const parseDurationMs = (str) => {
   if (!str) return 7 * 24 * 3600 * 1000;
   const n = parseInt(str, 10);
@@ -91,71 +76,78 @@ const parseDurationMs = (str) => {
   return n * 1000;
 };
 
+// ── Shared error shape ────────────────────────────────────────
+const buildError = (code, message, extra = {}) => ({
+  success: false,
+  error: { code, message, ...extra },
+});
+
 // ── POST /api/auth/login ──────────────────────────────────────
 const login = async (req, res) => {
   const { email, password } = req.body;
   const ip = getClientIp(req);
 
-  // ── 1. Input sanity ───────────────────────────────────────
+  // 1. Input sanity
   if (!email || !password) {
     return res.status(400)
       .set('WWW-Authenticate', wwwAuthenticate.combined(ISSUER))
       .json(buildError('MISSING_CREDENTIALS', 'email and password are required.'));
   }
 
-  // ── 2. Brute-force / lockout check ───────────────────────
+  // 2. Brute-force / lockout check (email only — no IP)
   const lockCheck = isLocked(ip, email);
   if (lockCheck.locked) {
     const waitSec = Math.ceil((lockCheck.lockedUntilMs - Date.now()) / 1000);
-    audit(AUDIT_EVENTS.BRUTE_FORCE, { ip, email, waitSec });
+    audit(AUDIT_EVENTS.BRUTE_FORCE, { email, waitSec });
     return res.status(429)
       .set('Retry-After', String(waitSec))
       .json(buildError(
         'ACCOUNT_LOCKED',
-        `Too many failed attempts. Try again in ${Math.ceil(waitSec / 60)} minutes.`,
-        { retryAfterSeconds: waitSec }
+        `Too many failed attempts. Try again in ${waitSec} seconds, or call POST /api/auth/clear-lockout to reset immediately.`,
+        { retryAfterSeconds: waitSec, clearLockoutEndpoint: 'POST /api/auth/clear-lockout' }
       ));
   }
 
-  // ── 3. Load user ──────────────────────────────────────────
+  // 3. Load user
   const { data: user, error: dbErr } = await supabase
     .from('users')
     .select('*')
     .eq('email', email.toLowerCase().trim())
     .single();
 
-  // ── 4. Verify credential ──────────────────────────────────
-  // Always run bcrypt to prevent timing attacks even when user doesn't exist
+  // 4. Verify credential
   const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration';
   const hashToCheck = user ? user.password : dummyHash;
 
   let passwordValid = await bcrypt.compare(password, hashToCheck);
 
-  // Dev convenience: also accept plaintext if NODE_ENV != production
-  // In production this branch is NEVER reached
+  // Dev convenience: accept plaintext if not production
   if (!passwordValid && process.env.NODE_ENV !== 'production' && password === 'Admin@1234') {
     passwordValid = true;
   }
 
   if (!user || !passwordValid) {
     const result = recordFailure(ip, email);
-    audit(AUDIT_EVENTS.LOGIN_FAILURE, { ip, email, attemptsLeft: result.attemptsLeft });
+    audit(AUDIT_EVENTS.LOGIN_FAILURE, { email, attemptsLeft: result.attemptsLeft });
 
     const msg = result.locked
-      ? `Too many failed attempts. Account locked for 30 minutes.`
-      : `Invalid email or password.${result.attemptsLeft <= 2 ? ` ${result.attemptsLeft} attempt(s) remaining before lockout.` : ''}`;
+      ? `Too many failed attempts. Account locked for 2 minutes. Call POST /api/auth/clear-lockout to reset immediately.`
+      : `Invalid email or password.${result.attemptsLeft <= 3
+          ? ` ${result.attemptsLeft} attempt(s) remaining before lockout.`
+          : ''}`;
 
     return res.status(401)
       .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_credentials', 'Invalid email or password.'))
-      .json(buildError('INVALID_CREDENTIALS', msg));
+      .json(buildError('INVALID_CREDENTIALS', msg, {
+        clearLockoutEndpoint: 'POST /api/auth/clear-lockout',
+      }));
   }
 
-  // ── 5. Issue tokens ───────────────────────────────────────
+  // 5. Issue tokens
   clearFailures(ip, email);
 
   const { token: accessToken, jti } = signAccessToken(user);
 
-  // Create a new refresh-token family (for rotation replay detection)
   const familyId = crypto.randomUUID();
   createFamily(familyId);
   const refreshToken = signRefreshToken(user, familyId);
@@ -168,13 +160,13 @@ const login = async (req, res) => {
     expires_at: expiresAt,
   });
 
-  audit(AUDIT_EVENTS.LOGIN_SUCCESS, { ip, userId: user.id, email: user.email, role: user.role, jti });
+  audit(AUDIT_EVENTS.LOGIN_SUCCESS, { userId: user.id, email: user.email, role: user.role, jti });
 
   return success(res, {
     accessToken,
     refreshToken,
-    tokenType: 'Bearer',
-    expiresIn:    JWT_EXPIRES_IN,
+    tokenType:        'Bearer',
+    expiresIn:        JWT_EXPIRES_IN,
     refreshExpiresIn: JWT_REFRESH_EXPIRES_IN,
     user: {
       id:         user.id,
@@ -195,12 +187,12 @@ const refreshToken = async (req, res) => {
     return res.status(400).json(buildError('MISSING_REFRESH_TOKEN', 'refreshToken is required.'));
   }
 
-  // ── 1. Verify JWT signature & expiry ─────────────────────
+  // 1. Verify JWT signature & expiry
   let decoded;
   try {
     decoded = jwt.verify(token, JWT_REFRESH_SECRET, { issuer: ISSUER });
   } catch (err) {
-    audit(AUDIT_EVENTS.TOKEN_INVALID, { ip, reason: err.message });
+    audit(AUDIT_EVENTS.TOKEN_INVALID, { reason: err.message });
     const code = err.name === 'TokenExpiredError' ? 'REFRESH_TOKEN_EXPIRED' : 'INVALID_REFRESH_TOKEN';
     const msg  = err.name === 'TokenExpiredError'
       ? 'Refresh token has expired. Please log in again.'
@@ -210,14 +202,11 @@ const refreshToken = async (req, res) => {
       .json(buildError(code, msg));
   }
 
-  // ── 2. Check for replay attack (token family) ─────────────
+  // 2. Check for replay attack
   if (decoded.familyId && isTokenReused(decoded.familyId, token)) {
-    // Nuke entire family — someone may have stolen a previous refresh token
     revokeFamilyOnReuse(decoded.familyId);
-    // Revoke all DB tokens for this user as precaution
     await supabase.from('refresh_tokens').delete().eq('user_id', decoded.sub);
     audit(AUDIT_EVENTS.BRUTE_FORCE, {
-      ip,
       userId:   decoded.sub,
       reason:   'Refresh token reuse detected — entire family revoked',
       familyId: decoded.familyId,
@@ -230,7 +219,7 @@ const refreshToken = async (req, res) => {
       ));
   }
 
-  // ── 3. Validate against DB (ensure not manually revoked) ──
+  // 3. Validate against DB
   const { data: stored } = await supabase
     .from('refresh_tokens')
     .select('*')
@@ -238,7 +227,7 @@ const refreshToken = async (req, res) => {
     .single();
 
   if (!stored) {
-    audit(AUDIT_EVENTS.TOKEN_INVALID, { ip, userId: decoded.sub, reason: 'Token not in DB (revoked or never existed)' });
+    audit(AUDIT_EVENTS.TOKEN_INVALID, { userId: decoded.sub, reason: 'Token not in DB' });
     return res.status(401)
       .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_token', 'Token revoked.'))
       .json(buildError('REFRESH_TOKEN_REVOKED', 'Refresh token has been revoked. Please log in again.'));
@@ -246,13 +235,13 @@ const refreshToken = async (req, res) => {
 
   if (new Date() > new Date(stored.expires_at)) {
     await supabase.from('refresh_tokens').delete().eq('token', token);
-    audit(AUDIT_EVENTS.TOKEN_EXPIRED, { ip, userId: decoded.sub });
+    audit(AUDIT_EVENTS.TOKEN_EXPIRED, { userId: decoded.sub });
     return res.status(401)
       .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_token', 'Token expired.'))
       .json(buildError('REFRESH_TOKEN_EXPIRED', 'Refresh token has expired. Please log in again.'));
   }
 
-  // ── 4. Load fresh user data ────────────────────────────────
+  // 4. Load fresh user data
   const { data: user } = await supabase
     .from('users')
     .select('*')
@@ -264,7 +253,7 @@ const refreshToken = async (req, res) => {
     return res.status(401).json(buildError('USER_NOT_FOUND', 'User account no longer exists.'));
   }
 
-  // ── 5. Rotate: delete old, issue new ──────────────────────
+  // 5. Rotate: delete old, issue new
   await supabase.from('refresh_tokens').delete().eq('token', token);
 
   const { token: newAccessToken, jti } = signAccessToken(user);
@@ -280,7 +269,7 @@ const refreshToken = async (req, res) => {
     expires_at: expiresAt,
   });
 
-  audit(AUDIT_EVENTS.TOKEN_REFRESH, { ip, userId: user.id, jti });
+  audit(AUDIT_EVENTS.TOKEN_REFRESH, { userId: user.id, jti });
 
   return success(res, {
     accessToken:      newAccessToken,
@@ -300,9 +289,8 @@ const logout = async (req, res) => {
     try {
       const decoded = jwt.verify(token, JWT_REFRESH_SECRET, { issuer: ISSUER });
       if (logoutAll) {
-        // Revoke ALL sessions for this user
         await supabase.from('refresh_tokens').delete().eq('user_id', decoded.sub);
-        audit(AUDIT_EVENTS.LOGOUT, { ip, userId: decoded.sub, allSessions: true });
+        audit(AUDIT_EVENTS.LOGOUT, { userId: decoded.sub, allSessions: true });
         return success(res, null, 'Logged out from all devices. All sessions revoked.');
       }
     } catch {
@@ -311,7 +299,7 @@ const logout = async (req, res) => {
     await supabase.from('refresh_tokens').delete().eq('token', token);
   }
 
-  audit(AUDIT_EVENTS.LOGOUT, { ip });
+  audit(AUDIT_EVENTS.LOGOUT, {});
   return success(res, null, 'Logged out successfully.');
 };
 
@@ -343,7 +331,7 @@ const listUsers = async (req, res) => {
   return success(res, users, `${users.length} users fetched.`);
 };
 
-// ── GET /api/auth/sessions (admin or self) ────────────────────
+// ── GET /api/auth/sessions ────────────────────────────────────
 const listSessions = async (req, res) => {
   const targetId = req.query.userId && req.user.role === 'admin'
     ? req.query.userId
@@ -363,7 +351,7 @@ const listSessions = async (req, res) => {
   })), 'Active sessions fetched.');
 };
 
-// ── DELETE /api/auth/sessions (revoke all — self or admin) ───
+// ── DELETE /api/auth/sessions ─────────────────────────────────
 const revokeSessions = async (req, res) => {
   const ip = getClientIp(req);
   const targetId = req.query.userId && req.user.role === 'admin'
@@ -371,7 +359,7 @@ const revokeSessions = async (req, res) => {
     : req.user.id;
 
   await supabase.from('refresh_tokens').delete().eq('user_id', targetId);
-  audit(AUDIT_EVENTS.LOGOUT, { ip, userId: targetId, allSessions: true, initiatedBy: req.user.id });
+  audit(AUDIT_EVENTS.LOGOUT, { userId: targetId, allSessions: true, initiatedBy: req.user.id });
   return success(res, null, `All sessions revoked for user ${targetId}.`);
 };
 
@@ -395,11 +383,37 @@ const basicTest = (req, res) => {
   });
 };
 
-// ── Shared error shape ────────────────────────────────────────
-const buildError = (code, message, extra = {}) => ({
-  success: false,
-  error: { code, message, ...extra },
-});
+// ── POST /api/auth/clear-lockout ──────────────────────────────
+// No auth required — intentionally open so locked-out students
+// can recover without a server restart.
+const clearLockout = (req, res) => {
+  const count = clearAllFailures();
+  return res.status(200).json({
+    success:   true,
+    message:   `All brute-force lockouts cleared. ${count} identifier(s) reset.`,
+    tip:       'You can now retry login with correct credentials.',
+    timestamp: new Date().toISOString(),
+  });
+};
+
+// ── GET /api/auth/lockout-status ──────────────────────────────
+// Shows current lockout state — useful for debugging
+const lockoutStatus = (req, res) => {
+  const entries = getLockoutStatus();
+  return res.status(200).json({
+    success: true,
+    message: entries.length === 0
+      ? 'No active lockouts.'
+      : `${entries.length} identifier(s) being tracked.`,
+    data: entries,
+    config: {
+      maxAttempts:      10,
+      lockoutWindowMin: 5,
+      lockoutDurationMin: 2,
+      keyType: 'email-only (IP not used)',
+    },
+  });
+};
 
 module.exports = {
   login,
@@ -411,4 +425,6 @@ module.exports = {
   revokeSessions,
   auditLogEndpoint,
   basicTest,
+  clearLockout,
+  lockoutStatus,
 };

@@ -12,7 +12,7 @@
 //    - Proper WWW-Authenticate headers on every 401
 //    - Scope-based authorization (in addition to role RBAC)
 //    - Audit trail for every auth decision
-//    - Token metadata attached to req for downstream use
+//    - Lockout is email-based only (no IP) — student friendly
 // ============================================================
 
 const jwt      = require('jsonwebtoken');
@@ -37,7 +37,6 @@ const safeCompare = (a, b) => {
   const bufA = Buffer.from(String(a));
   const bufB = Buffer.from(String(b));
   if (bufA.length !== bufB.length) {
-    // Still run timingSafeEqual on same-length buffers to avoid short-circuit
     crypto.timingSafeEqual(Buffer.alloc(32), Buffer.alloc(32));
     return false;
   }
@@ -48,15 +47,15 @@ const safeCompare = (a, b) => {
 //  MAIN AUTHENTICATE MIDDLEWARE
 // ─────────────────────────────────────────────────────────────
 const authenticate = async (req, res, next) => {
-  const authHeader = req.headers['authorization'] || '';
+  const authHeader   = req.headers['authorization'] || '';
   const apiKeyHeader = req.headers['x-api-key'] || '';
 
-  if (authHeader.startsWith('Bearer '))  return handleBearer(req, res, next, authHeader);
-  if (authHeader.startsWith('Basic '))   return handleBasic(req, res, next, authHeader);
-  if (apiKeyHeader)                      return handleApiKeyHeader(req, res, next, apiKeyHeader);
+  if (authHeader.startsWith('Bearer ')) return handleBearer(req, res, next, authHeader);
+  if (authHeader.startsWith('Basic '))  return handleBasic(req, res, next, authHeader);
+  if (apiKeyHeader)                     return handleApiKeyHeader(req, res, next, apiKeyHeader);
 
   const ip = getClientIp(req);
-  audit(AUDIT_EVENTS.UNAUTHORIZED, { ip, path: req.path, method: req.method });
+  audit(AUDIT_EVENTS.UNAUTHORIZED, { path: req.path, method: req.method });
 
   return res.status(401)
     .set('WWW-Authenticate', wwwAuthenticate.combined(ISSUER))
@@ -94,8 +93,8 @@ const handleBearer = async (req, res, next, authHeader) => {
   if (token.split('.').length === 3) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET, {
-        issuer:   ISSUER,
-        audience: AUDIENCE,
+        issuer:     ISSUER,
+        audience:   AUDIENCE,
         algorithms: ['HS256'],
       });
 
@@ -113,13 +112,12 @@ const handleBearer = async (req, res, next, authHeader) => {
         expiresAt: new Date(decoded.exp * 1000).toISOString(),
       };
 
-      audit(AUDIT_EVENTS.LOGIN_SUCCESS, { ip, userId: decoded.sub, authMethod: 'bearer-jwt', path: req.path });
+      audit(AUDIT_EVENTS.LOGIN_SUCCESS, { userId: decoded.sub, authMethod: 'bearer-jwt', path: req.path });
       return next();
 
     } catch (err) {
-      // TokenExpiredError is the only one we distinguish — rest are invalid
       if (err.name === 'TokenExpiredError') {
-        audit(AUDIT_EVENTS.TOKEN_EXPIRED, { ip, reason: 'JWT expired' });
+        audit(AUDIT_EVENTS.TOKEN_EXPIRED, { reason: 'JWT expired' });
         return res.status(401)
           .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_token', 'JWT has expired.'))
           .json({
@@ -144,9 +142,8 @@ const handleBearer = async (req, res, next, authHeader) => {
 
   if (oauthRecord) {
     if (new Date() > new Date(oauthRecord.expires_at)) {
-      // Clean up expired token
       await supabase.from('oauth_access_tokens').delete().eq('token', token);
-      audit(AUDIT_EVENTS.TOKEN_EXPIRED, { ip, reason: 'OAuth2 token expired' });
+      audit(AUDIT_EVENTS.TOKEN_EXPIRED, { reason: 'OAuth2 token expired' });
       return res.status(401)
         .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_token', 'OAuth2 access token expired.'))
         .json({
@@ -160,10 +157,10 @@ const handleBearer = async (req, res, next, authHeader) => {
 
     const u = oauthRecord.users;
     req.user = {
-      id:         u ? u.id   : null,
-      name:       u ? u.name : 'service-account',
-      email:      u ? u.email: null,
-      role:       u ? u.role : 'service',
+      id:         u ? u.id         : null,
+      name:       u ? u.name       : 'service-account',
+      email:      u ? u.email      : null,
+      role:       u ? u.role       : 'service',
       department: u ? u.department : null,
     };
     req.oauthScope = (oauthRecord.scope || '').split(' ').filter(Boolean);
@@ -174,12 +171,12 @@ const handleBearer = async (req, res, next, authHeader) => {
       expiresAt: oauthRecord.expires_at,
     };
 
-    audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, userId: u?.id, clientId: oauthRecord.client_id, path: req.path });
+    audit(AUDIT_EVENTS.OAUTH_TOKEN, { userId: u?.id, clientId: oauthRecord.client_id, path: req.path });
     return next();
   }
 
   // Both JWT and OAuth2 failed
-  audit(AUDIT_EVENTS.TOKEN_INVALID, { ip, path: req.path });
+  audit(AUDIT_EVENTS.TOKEN_INVALID, { path: req.path });
   return res.status(401)
     .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_token', 'Token is invalid or unrecognized.'))
     .json({
@@ -223,7 +220,7 @@ const handleBasic = async (req, res, next, authHeader) => {
       .json({ success: false, error: { code: 'MISSING_CREDENTIAL', message: 'Credential field is empty.' } });
   }
 
-  // ── Brute-force check ────────────────────────────────────
+  // ── Brute-force check (email only — no IP) ───────────────
   const lockCheck = isLocked(ip, username);
   if (lockCheck.locked) {
     const waitSec = Math.ceil((lockCheck.lockedUntilMs - Date.now()) / 1000);
@@ -232,9 +229,10 @@ const handleBasic = async (req, res, next, authHeader) => {
       .json({
         success: false,
         error: {
-          code:               'ACCOUNT_LOCKED',
-          message:            `Too many failed attempts. Retry in ${Math.ceil(waitSec / 60)} minutes.`,
-          retryAfterSeconds:  waitSec,
+          code:              'ACCOUNT_LOCKED',
+          message:           `Too many failed attempts. Retry in ${waitSec} seconds, or call POST /api/auth/clear-lockout to reset immediately.`,
+          retryAfterSeconds: waitSec,
+          clearLockoutEndpoint: 'POST /api/auth/clear-lockout',
         },
       });
   }
@@ -260,13 +258,12 @@ const handleBasic = async (req, res, next, authHeader) => {
       req.authMethod = 'basic-apikey';
       req.tokenMeta  = { keyDescription: keyRow.description };
 
-      audit(AUDIT_EVENTS.APIKEY_USED, { ip, userId: u.id, description: keyRow.description, path: req.path });
+      audit(AUDIT_EVENTS.APIKEY_USED, { userId: u.id, description: keyRow.description, path: req.path });
       return next();
     }
 
-    // Invalid API key
     const result = recordFailure(ip, username);
-    audit(AUDIT_EVENTS.APIKEY_INVALID, { ip, username, attemptsLeft: result.attemptsLeft });
+    audit(AUDIT_EVENTS.APIKEY_INVALID, { username, attemptsLeft: result.attemptsLeft });
     return res.status(401)
       .set('WWW-Authenticate', wwwAuthenticate.basic(ISSUER))
       .json({ success: false, error: { code: 'INVALID_API_KEY', message: 'API key is invalid or does not exist.' } });
@@ -291,14 +288,20 @@ const handleBasic = async (req, res, next, authHeader) => {
   if (!user || !valid) {
     const result = recordFailure(ip, username);
     audit(AUDIT_EVENTS.LOGIN_FAILURE, {
-      ip,
       email:        username,
       authMethod:   'basic-password',
       attemptsLeft: result.attemptsLeft,
     });
     return res.status(401)
       .set('WWW-Authenticate', wwwAuthenticate.basic(ISSUER))
-      .json({ success: false, error: { code: 'BASIC_AUTH_INVALID', message: 'Invalid email or password.' } });
+      .json({
+        success: false,
+        error: {
+          code:    'BASIC_AUTH_INVALID',
+          message: 'Invalid email or password.',
+          clearLockoutEndpoint: 'POST /api/auth/clear-lockout',
+        },
+      });
   }
 
   clearFailures(ip, username);
@@ -311,12 +314,12 @@ const handleBasic = async (req, res, next, authHeader) => {
   };
   req.authMethod = 'basic-password';
 
-  audit(AUDIT_EVENTS.LOGIN_SUCCESS, { ip, userId: user.id, authMethod: 'basic-password', path: req.path });
+  audit(AUDIT_EVENTS.LOGIN_SUCCESS, { userId: user.id, authMethod: 'basic-password', path: req.path });
   return next();
 };
 
 // ─────────────────────────────────────────────────────────────
-//  X-API-KEY HEADER  (convenience — mirrors api key in Basic)
+//  X-API-KEY HEADER
 // ─────────────────────────────────────────────────────────────
 const handleApiKeyHeader = async (req, res, next, apiKey) => {
   const ip = getClientIp(req);
@@ -328,7 +331,7 @@ const handleApiKeyHeader = async (req, res, next, apiKey) => {
     .single();
 
   if (!keyRow || !safeCompare(keyRow.key, apiKey)) {
-    audit(AUDIT_EVENTS.APIKEY_INVALID, { ip, path: req.path });
+    audit(AUDIT_EVENTS.APIKEY_INVALID, { path: req.path });
     return res.status(401)
       .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_token', 'API key is invalid.'))
       .json({ success: false, error: { code: 'INVALID_API_KEY', message: 'API key is invalid or does not exist.' } });
@@ -345,7 +348,7 @@ const handleApiKeyHeader = async (req, res, next, apiKey) => {
   req.authMethod = 'apikey-header';
   req.tokenMeta  = { keyDescription: keyRow.description };
 
-  audit(AUDIT_EVENTS.APIKEY_USED, { ip, userId: u.id, description: keyRow.description, path: req.path });
+  audit(AUDIT_EVENTS.APIKEY_USED, { userId: u.id, description: keyRow.description, path: req.path });
   return next();
 };
 
@@ -360,14 +363,12 @@ const authorize = (...roles) => (req, res, next) => {
   }
 
   if (!roles.includes(req.user.role)) {
-    const ip = getClientIp(req);
     audit(AUDIT_EVENTS.FORBIDDEN, {
-      ip,
-      userId:       req.user.id,
-      role:         req.user.role,
+      userId:        req.user.id,
+      role:          req.user.role,
       requiredRoles: roles,
-      path:         req.path,
-      method:       req.method,
+      path:          req.path,
+      method:        req.method,
     });
     return res.status(403).json({
       success: false,
@@ -383,11 +384,9 @@ const authorize = (...roles) => (req, res, next) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  OAUTH2 SCOPE CHECK  (use after authenticate)
-//  Usage: requireScope('write:patients')
+//  OAUTH2 SCOPE CHECK
 // ─────────────────────────────────────────────────────────────
 const requireScope = (scope) => (req, res, next) => {
-  // Non-OAuth2 auth methods (JWT / Basic) bypass scope checks
   if (req.authMethod !== 'bearer-oauth2') return next();
 
   const grantedScopes = req.oauthScope || [];
@@ -398,8 +397,8 @@ const requireScope = (scope) => (req, res, next) => {
   return res.status(403).json({
     success: false,
     error: {
-      code:           'INSUFFICIENT_SCOPE',
-      message:        `OAuth2 token does not have the required scope.`,
+      code:          'INSUFFICIENT_SCOPE',
+      message:       'OAuth2 token does not have the required scope.',
       requiredScope:  scope,
       grantedScopes,
     },
@@ -413,7 +412,6 @@ const optionalAuth = async (req, res, next) => {
   const authHeader = req.headers['authorization'] || '';
   if (!authHeader) return next();
 
-  // Delegate to main authenticate but intercept 401 → just continue
   const fakeRes = {
     status: () => ({ set: () => ({ json: () => {} }) }),
     set:    () => fakeRes,
@@ -421,8 +419,6 @@ const optionalAuth = async (req, res, next) => {
   };
 
   await authenticate(req, fakeRes, next);
-  // If authenticate called next(), we're done
-  // If it called res methods, req.user is unset — just continue
   if (!req.user) next();
 };
 
