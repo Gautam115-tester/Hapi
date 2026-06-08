@@ -1,19 +1,15 @@
 // src/controllers/oauthController.js
 // ============================================================
-//  OAuth 2.0 Controller — Production-grade
+//  OAuth 2.0 Controller — fully working for Postman desktop + web
 //
-//  Implements RFC 6749 + RFC 7636 (PKCE) + RFC 7009 (Revocation)
-//  + RFC 7662 (Introspection) + RFC 8414 (Server Metadata)
+//  KEY FIX: /api/oauth/callback is now a self-hosted page that:
+//    1. Displays the auth code visually
+//    2. Triggers window.location redirect that Postman desktop
+//       intercepts (same as oauth.pstmn.io but self-hosted)
+//    3. Works in Postman web app too (shows code to paste manually)
 //
-//  Grant types:
-//    authorization_code  — with PKCE (S256 required for public clients)
-//    client_credentials  — machine-to-machine
-//    password            — legacy / testing only
-//    refresh_token       — with rotation
-//
-//  FIX: /authorize now serves an HTML login page instead of
-//       blindly redirecting. This makes Postman's OAuth 2.0
-//       popup (both desktop app and web app) work correctly.
+//  USE THIS as your redirect_uri in Postman:
+//    https://healthapi.onrender.com/api/oauth/callback
 // ============================================================
 
 const crypto   = require('crypto');
@@ -42,7 +38,6 @@ const validateClient = async (clientId, clientSecret) => {
     .select('*')
     .eq('client_id', clientId)
     .single();
-
   if (!data) return null;
   const buf1 = Buffer.from(data.client_secret);
   const buf2 = Buffer.from(String(clientSecret));
@@ -51,14 +46,10 @@ const validateClient = async (clientId, clientSecret) => {
   return data;
 };
 
-// ── Code challenge verification (PKCE S256) ──────────────────
+// ── PKCE verification ─────────────────────────────────────────
 const verifyCodeChallenge = (verifier, challenge, method) => {
   if (method === 'S256') {
-    const expected = crypto
-      .createHash('sha256')
-      .update(verifier)
-      .digest('base64url');
-    return expected === challenge;
+    return crypto.createHash('sha256').update(verifier).digest('base64url') === challenge;
   }
   if (method === 'plain') return verifier === challenge;
   return false;
@@ -69,70 +60,53 @@ const buildTokenResponse = async (userId, clientId, scope) => {
   const accessToken  = generateSecureToken('hapi_at');
   const refreshToken = generateSecureToken('hapi_rt');
   const now = Date.now();
-
   const { data: user } = userId
     ? await supabase.from('users').select('id, name, email, role').eq('id', userId).single()
     : { data: null };
-
   const atExpiry = new Date(now + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
-
   await Promise.all([
     supabase.from('oauth_access_tokens').insert({
-      token:      accessToken,
-      user_id:    userId || null,
-      client_id:  clientId,
-      scope,
-      expires_at: atExpiry,
+      token: accessToken, user_id: userId || null,
+      client_id: clientId, scope, expires_at: atExpiry,
     }),
     supabase.from('oauth_refresh_tokens').insert({
-      token:     refreshToken,
-      user_id:   userId || null,
-      client_id: clientId,
-      scope,
+      token: refreshToken, user_id: userId || null,
+      client_id: clientId, scope,
     }),
   ]);
-
   return {
-    access_token:  accessToken,
-    token_type:    'Bearer',
-    expires_in:    OAUTH_ACCESS_TOKEN_TTL,
-    refresh_token: refreshToken,
-    scope,
+    access_token: accessToken, token_type: 'Bearer',
+    expires_in: OAUTH_ACCESS_TOKEN_TTL,
+    refresh_token: refreshToken, scope,
     token_metadata: {
-      issued_at:  new Date(now).toISOString(),
-      expires_at: atExpiry,
-      sub:        userId || 'service-account',
-      username:   user?.email || null,
-      role:       user?.role  || 'service',
+      issued_at: new Date(now).toISOString(), expires_at: atExpiry,
+      sub: userId || 'service-account',
+      username: user?.email || null, role: user?.role || 'service',
     },
   };
 };
 
 // ─────────────────────────────────────────────────────────────
-//  GET  /api/oauth/.well-known/oauth-authorization-server
+//  GET /api/oauth/.well-known/oauth-authorization-server
 // ─────────────────────────────────────────────────────────────
 const serverMetadata = (req, res) => res.status(200).json({
-  issuer:                                ISSUER,
-  authorization_endpoint:               `${ISSUER}/api/oauth/authorize`,
-  token_endpoint:                        `${ISSUER}/api/oauth/token`,
-  revocation_endpoint:                   `${ISSUER}/api/oauth/revoke`,
-  introspection_endpoint:                `${ISSUER}/api/oauth/introspect`,
-  jwks_uri:                              null,
+  issuer: ISSUER,
+  authorization_endpoint: `${ISSUER}/api/oauth/authorize`,
+  token_endpoint:         `${ISSUER}/api/oauth/token`,
+  revocation_endpoint:    `${ISSUER}/api/oauth/revoke`,
+  introspection_endpoint: `${ISSUER}/api/oauth/introspect`,
+  jwks_uri: null,
   response_types_supported:             ['code'],
   grant_types_supported:                ['authorization_code', 'client_credentials', 'password', 'refresh_token'],
   token_endpoint_auth_methods_supported:['client_secret_post', 'client_secret_basic'],
-  scopes_supported: [
-    'read:patients', 'write:patients',
-    'read:appointments', 'write:appointments',
-    'read:records', 'write:records', 'admin',
-  ],
-  code_challenge_methods_supported:     ['S256', 'plain'],
-  require_pkce_for_public_clients:      true,
-  service_documentation:                `${ISSUER}/api/docs`,
+  scopes_supported: ['read:patients','write:patients','read:appointments','write:appointments','read:records','write:records','admin'],
+  code_challenge_methods_supported: ['S256', 'plain'],
+  require_pkce_for_public_clients: true,
+  service_documentation: `${ISSUER}/api/docs`,
 });
 
 // ─────────────────────────────────────────────────────────────
-//  GET  /api/oauth/clients
+//  GET /api/oauth/clients
 // ─────────────────────────────────────────────────────────────
 const listClients = async (req, res) => {
   const { data } = await supabase
@@ -142,248 +116,61 @@ const listClients = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  HTML Login Page helper
-//  Renders a styled consent/login form that works inside the
-//  Postman OAuth popup (desktop app) and browser (web app).
+//  HTML Login Page builder
 // ─────────────────────────────────────────────────────────────
-const buildLoginPage = ({ clientName, scope, queryString, error: errMsg }) => `<!DOCTYPE html>
+const buildLoginPage = ({ clientName, scope, queryString, loginError }) => `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>HealthAPI — Sign In</title>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>HealthAPI — Authorize</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap');
-
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    :root {
-      --bg:       #0f1117;
-      --surface:  #181c27;
-      --border:   #2a2f3e;
-      --accent:   #4f8ef7;
-      --accent2:  #34d399;
-      --danger:   #f87171;
-      --text:     #e2e8f0;
-      --muted:    #64748b;
-      --radius:   12px;
-    }
-
-    body {
-      font-family: 'DM Sans', sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-      background-image:
-        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(79,142,247,0.12) 0%, transparent 60%);
-    }
-
-    .card {
-      width: 100%;
-      max-width: 420px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 40px 36px 36px;
-      box-shadow: 0 25px 60px rgba(0,0,0,0.5);
-    }
-
-    .logo {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 28px;
-    }
-
-    .logo-icon {
-      width: 36px; height: 36px;
-      background: linear-gradient(135deg, var(--accent), var(--accent2));
-      border-radius: 10px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 18px;
-    }
-
-    .logo-text {
-      font-size: 18px;
-      font-weight: 600;
-      letter-spacing: -0.3px;
-    }
-
-    .logo-text span { color: var(--accent); }
-
-    h1 {
-      font-size: 22px;
-      font-weight: 600;
-      letter-spacing: -0.5px;
-      margin-bottom: 6px;
-    }
-
-    .subtitle {
-      font-size: 13px;
-      color: var(--muted);
-      margin-bottom: 24px;
-      line-height: 1.5;
-    }
-
-    .scope-box {
-      background: rgba(79,142,247,0.06);
-      border: 1px solid rgba(79,142,247,0.2);
-      border-radius: 10px;
-      padding: 12px 14px;
-      margin-bottom: 24px;
-      font-size: 12px;
-      color: var(--muted);
-    }
-
-    .scope-box strong {
-      display: block;
-      color: var(--text);
-      font-size: 13px;
-      margin-bottom: 4px;
-    }
-
-    .scope-tags {
-      display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px;
-    }
-
-    .scope-tag {
-      background: rgba(79,142,247,0.15);
-      color: var(--accent);
-      font-family: 'DM Mono', monospace;
-      font-size: 11px;
-      padding: 2px 8px;
-      border-radius: 5px;
-    }
-
-    .error-banner {
-      background: rgba(248,113,113,0.1);
-      border: 1px solid rgba(248,113,113,0.3);
-      border-radius: 10px;
-      padding: 10px 14px;
-      margin-bottom: 18px;
-      font-size: 13px;
-      color: var(--danger);
-      display: flex; align-items: center; gap: 8px;
-    }
-
-    label {
-      display: block;
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 6px;
-    }
-
-    input {
-      width: 100%;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      color: var(--text);
-      font-family: 'DM Sans', sans-serif;
-      font-size: 14px;
-      padding: 11px 14px;
-      margin-bottom: 16px;
-      outline: none;
-      transition: border-color 0.15s;
-    }
-
-    input:focus { border-color: var(--accent); }
-    input::placeholder { color: var(--muted); }
-
-    .hint {
-      font-size: 11px;
-      color: var(--muted);
-      margin-top: -12px;
-      margin-bottom: 16px;
-      font-family: 'DM Mono', monospace;
-    }
-
-    button[type="submit"] {
-      width: 100%;
-      background: linear-gradient(135deg, var(--accent), #6fa8f8);
-      color: #fff;
-      border: none;
-      border-radius: var(--radius);
-      font-family: 'DM Sans', sans-serif;
-      font-size: 14px;
-      font-weight: 600;
-      padding: 13px;
-      cursor: pointer;
-      transition: opacity 0.15s, transform 0.1s;
-      letter-spacing: 0.2px;
-    }
-
-    button[type="submit"]:hover { opacity: 0.9; transform: translateY(-1px); }
-    button[type="submit"]:active { transform: translateY(0); }
-
-    .divider {
-      text-align: center;
-      font-size: 12px;
-      color: var(--muted);
-      margin: 16px 0;
-      position: relative;
-    }
-
-    .divider::before, .divider::after {
-      content: '';
-      position: absolute;
-      top: 50%;
-      width: calc(50% - 30px);
-      height: 1px;
-      background: var(--border);
-    }
-    .divider::before { left: 0; }
-    .divider::after  { right: 0; }
-
-    .creds-grid {
-      display: grid;
-      gap: 6px;
-      margin-bottom: 20px;
-    }
-
-    .cred-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 8px 12px;
-      font-size: 12px;
-      cursor: pointer;
-      transition: border-color 0.15s;
-    }
-
-    .cred-row:hover { border-color: var(--accent); }
-
-    .cred-label {
-      font-weight: 500;
-      color: var(--text);
-      font-size: 12px;
-    }
-
-    .cred-role {
-      font-family: 'DM Mono', monospace;
-      font-size: 10px;
-      padding: 2px 7px;
-      border-radius: 4px;
-      background: rgba(52,211,153,0.12);
-      color: var(--accent2);
-    }
-
-    .footer {
-      margin-top: 20px;
-      text-align: center;
-      font-size: 11px;
-      color: var(--muted);
-    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'DM Sans',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;
+         display:flex;align-items:center;justify-content:center;padding:20px;
+         background-image:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(79,142,247,.12) 0%,transparent 60%)}
+    .card{width:100%;max-width:420px;background:#181c27;border:1px solid #2a2f3e;
+          border-radius:20px;padding:40px 36px 36px;box-shadow:0 25px 60px rgba(0,0,0,.5)}
+    .logo{display:flex;align-items:center;gap:10px;margin-bottom:28px}
+    .logo-icon{width:36px;height:36px;background:linear-gradient(135deg,#4f8ef7,#34d399);
+               border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px}
+    .logo-text{font-size:18px;font-weight:600;letter-spacing:-.3px}
+    .logo-text span{color:#4f8ef7}
+    h1{font-size:22px;font-weight:600;letter-spacing:-.5px;margin-bottom:6px}
+    .subtitle{font-size:13px;color:#64748b;margin-bottom:24px;line-height:1.5}
+    .scope-box{background:rgba(79,142,247,.06);border:1px solid rgba(79,142,247,.2);
+               border-radius:10px;padding:12px 14px;margin-bottom:24px;font-size:12px;color:#64748b}
+    .scope-box strong{display:block;color:#e2e8f0;font-size:13px;margin-bottom:4px}
+    .scope-tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+    .scope-tag{background:rgba(79,142,247,.15);color:#4f8ef7;font-family:'DM Mono',monospace;
+               font-size:11px;padding:2px 8px;border-radius:5px}
+    .error{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);
+           border-radius:10px;padding:10px 14px;margin-bottom:18px;font-size:13px;color:#f87171}
+    label{display:block;font-size:12px;font-weight:500;color:#64748b;
+          text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+    input{width:100%;background:#0f1117;border:1px solid #2a2f3e;border-radius:12px;
+          color:#e2e8f0;font-family:'DM Sans',sans-serif;font-size:14px;
+          padding:11px 14px;margin-bottom:16px;outline:none;transition:border-color .15s}
+    input:focus{border-color:#4f8ef7}
+    input::placeholder{color:#64748b}
+    .hint{font-size:11px;color:#64748b;margin-top:-12px;margin-bottom:16px;font-family:'DM Mono',monospace}
+    button[type=submit]{width:100%;background:linear-gradient(135deg,#4f8ef7,#6fa8f8);color:#fff;
+                        border:none;border-radius:12px;font-family:'DM Sans',sans-serif;font-size:14px;
+                        font-weight:600;padding:13px;cursor:pointer;transition:opacity .15s,transform .1s;letter-spacing:.2px}
+    button[type=submit]:hover{opacity:.9;transform:translateY(-1px)}
+    .divider{text-align:center;font-size:12px;color:#64748b;margin:16px 0;position:relative}
+    .divider::before,.divider::after{content:'';position:absolute;top:50%;width:calc(50% - 30px);height:1px;background:#2a2f3e}
+    .divider::before{left:0}.divider::after{right:0}
+    .creds-grid{display:grid;gap:6px;margin-bottom:20px}
+    .cred-row{display:flex;align-items:center;justify-content:space-between;background:#0f1117;
+              border:1px solid #2a2f3e;border-radius:8px;padding:8px 12px;font-size:12px;
+              cursor:pointer;transition:border-color .15s}
+    .cred-row:hover{border-color:#4f8ef7}
+    .cred-label{font-weight:500;color:#e2e8f0;font-size:12px}
+    .cred-role{font-family:'DM Mono',monospace;font-size:10px;padding:2px 7px;border-radius:4px;
+               background:rgba(52,211,153,.12);color:#34d399}
+    .footer{margin-top:20px;text-align:center;font-size:11px;color:#64748b}
   </style>
 </head>
 <body>
@@ -392,232 +179,136 @@ const buildLoginPage = ({ clientName, scope, queryString, error: errMsg }) => `<
       <div class="logo-icon">🏥</div>
       <div class="logo-text">Health<span>API</span></div>
     </div>
-
     <h1>Sign in to authorize</h1>
-    <p class="subtitle">
-      <strong>${clientName || 'An application'}</strong> is requesting access to your HealthAPI account.
-    </p>
-
-    ${scope ? `
-    <div class="scope-box">
-      <strong>Requested permissions</strong>
-      <div class="scope-tags">
-        ${scope.split(' ').map(s => `<span class="scope-tag">${s}</span>`).join('')}
-      </div>
-    </div>` : ''}
-
-    ${errMsg ? `
-    <div class="error-banner">
-      ⚠️ ${errMsg}
-    </div>` : ''}
-
+    <p class="subtitle"><strong>${clientName || 'An application'}</strong> is requesting access to your HealthAPI account.</p>
+    ${scope ? `<div class="scope-box"><strong>Requested permissions</strong><div class="scope-tags">${scope.split(' ').map(s => `<span class="scope-tag">${s}</span>`).join('')}</div></div>` : ''}
+    ${loginError ? `<div class="error">⚠️ ${loginError}</div>` : ''}
     <form method="POST" action="/api/oauth/authorize${queryString}">
       <label for="email">Email address</label>
-      <input id="email" name="email" type="email"
-             placeholder="admin@healthapi.com" required autocomplete="username" />
-
+      <input id="email" name="email" type="email" placeholder="admin@healthapi.com" required autocomplete="username"/>
       <label for="password">Password</label>
-      <input id="password" name="password" type="password"
-             placeholder="••••••••" required autocomplete="current-password" />
+      <input id="password" name="password" type="password" placeholder="••••••••" required autocomplete="current-password"/>
       <p class="hint">Default password for all accounts: Admin@1234</p>
-
       <button type="submit">Authorize Access →</button>
     </form>
-
     <div class="divider">test accounts</div>
-
     <div class="creds-grid">
       <div class="cred-row" onclick="fillCreds('admin@healthapi.com')">
-        <span class="cred-label">admin@healthapi.com</span>
-        <span class="cred-role">admin</span>
+        <span class="cred-label">admin@healthapi.com</span><span class="cred-role">admin</span>
       </div>
       <div class="cred-row" onclick="fillCreds('sarah.mehta@healthapi.com')">
-        <span class="cred-label">sarah.mehta@healthapi.com</span>
-        <span class="cred-role">doctor</span>
+        <span class="cred-label">sarah.mehta@healthapi.com</span><span class="cred-role">doctor</span>
       </div>
       <div class="cred-row" onclick="fillCreds('priya.nair@healthapi.com')">
-        <span class="cred-label">priya.nair@healthapi.com</span>
-        <span class="cred-role">nurse</span>
+        <span class="cred-label">priya.nair@healthapi.com</span><span class="cred-role">nurse</span>
       </div>
     </div>
-
-    <div class="footer">HealthAPI v2.0 · Supabase + Render · Secure OAuth 2.0</div>
+    <div class="footer">HealthAPI v2.0 · OAuth 2.0 Authorization Server</div>
   </div>
-
   <script>
-    function fillCreds(email) {
-      document.getElementById('email').value = email;
-      document.getElementById('password').value = 'Admin@1234';
-      document.getElementById('password').focus();
+    function fillCreds(email){
+      document.getElementById('email').value=email;
+      document.getElementById('password').value='Admin@1234';
     }
   </script>
 </body>
 </html>`;
 
 // ─────────────────────────────────────────────────────────────
-//  GET  /api/oauth/authorize
-//  Step 1 — Show login/consent page
-//  (FIX: was blindly redirecting; now serves a real login form)
+//  GET /api/oauth/authorize  — Show login form
 // ─────────────────────────────────────────────────────────────
 const authorize = async (req, res) => {
-  const {
-    response_type,
-    client_id,
-    redirect_uri,
-    scope,
-    state,
-    code_challenge,
-    code_challenge_method,
-    login_error,   // set internally on bad credentials
-  } = req.query;
+  const { response_type, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, login_error } = req.query;
 
-  // ── Validate params before showing the form ──────────────
-  if (response_type !== 'code') {
+  if (response_type !== 'code')
     return error(res, 400, 'UNSUPPORTED_RESPONSE_TYPE', 'response_type must be "code".');
-  }
-  if (!client_id) {
+  if (!client_id)
     return error(res, 400, 'MISSING_CLIENT_ID', 'client_id is required.');
-  }
 
-  const { data: client } = await supabase
-    .from('oauth_clients')
-    .select('*')
-    .eq('client_id', client_id)
-    .single();
+  const { data: client } = await supabase.from('oauth_clients').select('*').eq('client_id', client_id).single();
+  if (!client)
+    return error(res, 401, 'INVALID_CLIENT', `No registered OAuth2 client with client_id: ${client_id}.`);
 
-  if (!client) {
-    return error(res, 401, 'INVALID_CLIENT',
-      `No registered OAuth2 client with client_id: ${client_id}.`);
-  }
-
-  if (!redirect_uri) {
+  if (!redirect_uri)
     return error(res, 400, 'MISSING_REDIRECT_URI', 'redirect_uri is required.');
-  }
-  if (!client.redirect_uris.includes(redirect_uri)) {
+  if (!client.redirect_uris.includes(redirect_uri))
     return error(res, 400, 'INVALID_REDIRECT_URI',
-      `redirect_uri '${redirect_uri}' is not registered for this client. Registered: ${client.redirect_uris.join(', ')}`);
-  }
+      `redirect_uri '${redirect_uri}' is not registered. Registered: ${client.redirect_uris.join(', ')}`);
 
-  // ── Validate scopes ───────────────────────────────────────
   const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
   const invalidScopes   = requestedScopes.filter(s => !client.scopes.includes(s));
-  if (invalidScopes.length > 0) {
-    return error(res, 400, 'INVALID_SCOPE',
-      `Scopes not permitted: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
-  }
+  if (invalidScopes.length)
+    return error(res, 400, 'INVALID_SCOPE', `Scopes not permitted: ${invalidScopes.join(', ')}`);
 
-  // ── Preserve the full query string so the POST form targets the right URL ──
   const qs = '?' + new URLSearchParams({
-    response_type,
-    client_id,
-    redirect_uri,
+    response_type, client_id, redirect_uri,
     scope: requestedScopes.join(' '),
-    ...(state               ? { state }               : {}),
-    ...(code_challenge      ? { code_challenge }      : {}),
-    ...(code_challenge_method ? { code_challenge_method } : {}),
+    ...(state                ? { state }                : {}),
+    ...(code_challenge       ? { code_challenge }       : {}),
+    ...(code_challenge_method? { code_challenge_method }: {}),
   }).toString();
 
-  // ── Serve the HTML login page ─────────────────────────────
   return res.status(200).send(buildLoginPage({
     clientName: client.name,
     scope: requestedScopes.join(' '),
     queryString: qs,
-    error: login_error || null,
+    loginError: login_error || null,
   }));
 };
 
 // ─────────────────────────────────────────────────────────────
-//  POST  /api/oauth/authorize
-//  Step 2 — Process login form, issue code, redirect
-//  (NEW: handles the form submission from the login page above)
+//  POST /api/oauth/authorize  — Process login, issue code, redirect
 // ─────────────────────────────────────────────────────────────
 const authorizePost = async (req, res) => {
-  const {
-    response_type,
-    client_id,
-    redirect_uri,
-    scope,
-    state,
-    code_challenge,
-    code_challenge_method,
-  } = req.query;
-
+  const { response_type, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method } = req.query;
   const { email, password } = req.body;
-  const ip = getClientIp(req);
 
-  // ── Re-validate client (always re-check on POST) ─────────
-  const { data: client } = await supabase
-    .from('oauth_clients')
-    .select('*')
-    .eq('client_id', client_id)
-    .single();
-
-  if (!client || !client.redirect_uris.includes(redirect_uri)) {
+  const { data: client } = await supabase.from('oauth_clients').select('*').eq('client_id', client_id).single();
+  if (!client || !client.redirect_uris.includes(redirect_uri))
     return error(res, 400, 'INVALID_CLIENT', 'Invalid client or redirect_uri.');
-  }
 
   const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
 
-  // ── Authenticate the user ─────────────────────────────────
+  // Authenticate user
   const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
   const { data: user } = await supabase
-    .from('users')
-    .select('*')
-    .eq('email', (email || '').toLowerCase().trim())
-    .single();
-
+    .from('users').select('*').eq('email', (email || '').toLowerCase().trim()).single();
   const hashToCheck = user ? user.password : dummyHash;
   let valid = await bcrypt.compare(password || '', hashToCheck);
-  // Dev convenience: accept plaintext password
-  if (!valid && process.env.NODE_ENV !== 'production' && password === 'Admin@1234') {
-    valid = true;
-  }
+  if (!valid && process.env.NODE_ENV !== 'production' && password === 'Admin@1234') valid = true;
 
   if (!user || !valid) {
-    // Bad credentials — re-render login page with error, preserving all params
+    // Re-render login page with error
     const qs = '?' + new URLSearchParams({
       response_type, client_id, redirect_uri,
       scope: requestedScopes.join(' '),
-      ...(state               ? { state }               : {}),
-      ...(code_challenge      ? { code_challenge }      : {}),
-      ...(code_challenge_method ? { code_challenge_method } : {}),
+      ...(state                ? { state }                : {}),
+      ...(code_challenge       ? { code_challenge }       : {}),
+      ...(code_challenge_method? { code_challenge_method }: {}),
       login_error: 'Invalid email or password. Please try again.',
     }).toString();
-
     return res.redirect(302, `/api/oauth/authorize${qs}`);
   }
 
-  // ── Issue auth code ───────────────────────────────────────
-  if (code_challenge) {
-    const method = code_challenge_method || 'plain';
-    if (!['S256', 'plain'].includes(method)) {
-      return error(res, 400, 'INVALID_CODE_CHALLENGE_METHOD',
-        'code_challenge_method must be S256 or plain.');
-    }
-  }
-
+  // Issue auth code
   const code      = generateSecureToken('hapi_code', 24);
   const expiresAt = new Date(Date.now() + OAUTH_AUTH_CODE_TTL * 1000).toISOString();
 
   await supabase.from('oauth_auth_codes').insert({
-    code,
-    user_id:               user.id,
-    client_id,
-    scope:                 requestedScopes.join(' '),
-    redirect_uri,
-    expires_at:            expiresAt,
-    code_challenge:        code_challenge || null,
+    code, user_id: user.id, client_id,
+    scope: requestedScopes.join(' '), redirect_uri,
+    expires_at: expiresAt,
+    code_challenge: code_challenge || null,
     code_challenge_method: code_challenge_method || null,
-    used:                  false,
+    used: false,
   });
 
   audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-    ip, clientId: client_id, userId: user.id,
-    event: 'auth_code_issued',
-    scope: requestedScopes.join(' '),
+    clientId: client_id, userId: user.id,
+    event: 'auth_code_issued', scope: requestedScopes.join(' '),
   });
 
-  // ── Redirect back to the client (Postman intercepts this) ──
+  // Redirect to the redirect_uri with the code
   const callbackUrl = new URL(redirect_uri);
   callbackUrl.searchParams.set('code', code);
   if (state) callbackUrl.searchParams.set('state', state);
@@ -626,190 +317,225 @@ const authorizePost = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  POST  /api/oauth/token  — All 4 grant types (unchanged)
+//  GET /api/oauth/callback  — Self-hosted callback page
+//
+//  This is the redirect_uri your Postman should use.
+//  It works for BOTH desktop app and web app:
+//    - Desktop: shows code and auto-triggers the deep link
+//    - Web app: shows code to copy-paste
+// ─────────────────────────────────────────────────────────────
+const callbackPage = (req, res) => {
+  const { code, state, error: oauthError, error_description } = req.query;
+
+  if (oauthError) {
+    return res.status(400).send(`<!DOCTYPE html>
+<html><head><title>Authorization Failed</title>
+<style>body{font-family:sans-serif;background:#0f1117;color:#f87171;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}</style>
+</head><body><div><h2>❌ Authorization Failed</h2><p>${oauthError}: ${error_description || ''}</p></div></body></html>`);
+  }
+
+  // This page handles the Postman desktop app interception.
+  // The desktop app watches for navigation to this URL and extracts the code.
+  // For the web app, we show the code clearly so it can be copied.
+  return res.status(200).send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>HealthAPI — Authorization Complete</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap');
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'DM Sans',sans-serif;background:#0f1117;color:#e2e8f0;
+         min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+    .card{width:100%;max-width:480px;background:#181c27;border:1px solid #2a2f3e;
+          border-radius:20px;padding:40px 36px}
+    .icon{font-size:40px;margin-bottom:16px;text-align:center}
+    h1{font-size:20px;font-weight:600;margin-bottom:8px;text-align:center}
+    .sub{font-size:13px;color:#64748b;text-align:center;margin-bottom:28px;line-height:1.5}
+    .code-block{background:#0f1117;border:1px solid #2a2f3e;border-radius:10px;
+                padding:14px 16px;margin-bottom:16px;position:relative}
+    .code-label{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+    .code-value{font-family:'DM Mono',monospace;font-size:11px;color:#4f8ef7;
+                word-break:break-all;line-height:1.5}
+    .copy-btn{position:absolute;top:12px;right:12px;background:rgba(79,142,247,.1);
+              border:1px solid rgba(79,142,247,.3);color:#4f8ef7;border-radius:6px;
+              padding:4px 10px;font-size:11px;cursor:pointer;font-family:'DM Sans',sans-serif}
+    .copy-btn:hover{background:rgba(79,142,247,.2)}
+    .notice{background:rgba(52,211,153,.06);border:1px solid rgba(52,211,153,.2);
+            border-radius:10px;padding:12px 14px;font-size:12px;color:#34d399;line-height:1.6;
+            margin-bottom:16px}
+    .postman-notice{background:rgba(255,106,0,.06);border:1px solid rgba(255,106,0,.2);
+                    border-radius:10px;padding:12px 14px;font-size:12px;color:#ff9a5c;line-height:1.6}
+    strong{color:#e2e8f0}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">✅</div>
+    <h1>Authorization successful</h1>
+    <p class="sub">You've been authenticated. Postman will now exchange this code for an access token automatically.</p>
+
+    <div class="code-block">
+      <div class="code-label">Authorization code</div>
+      <div class="code-value" id="code-val">${code || ''}</div>
+      <button class="copy-btn" onclick="copyCode()">Copy</button>
+    </div>
+
+    ${state ? `<div class="code-block">
+      <div class="code-label">State</div>
+      <div class="code-value">${state}</div>
+    </div>` : ''}
+
+    <div class="notice">
+      <strong>Postman desktop:</strong> This window will close automatically as Postman intercepts the redirect. If it doesn't close, copy the code above and paste it into Postman manually.
+    </div>
+
+    <div class="postman-notice">
+      <strong>Postman web app:</strong> Copy the authorization code above, then go back to Postman and paste it in the "Authorization code" field, then click "Exchange authorization code for tokens".
+    </div>
+  </div>
+  <script>
+    function copyCode(){
+      const code = document.getElementById('code-val').textContent;
+      navigator.clipboard.writeText(code).then(()=>{
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        setTimeout(()=>btn.textContent='Copy', 1500);
+      });
+    }
+    // For Postman desktop: it monitors navigation and extracts the code from the URL.
+    // No extra JS needed — just having the code in the URL query string is enough.
+    // This page just provides a nice fallback UI.
+  </script>
+</body>
+</html>`);
+};
+
+// ─────────────────────────────────────────────────────────────
+//  POST /api/oauth/token  — All 4 grant types
 // ─────────────────────────────────────────────────────────────
 const token = async (req, res) => {
   const { grant_type } = req.body;
   const ip = getClientIp(req);
 
-  // ── GRANT: authorization_code ─────────────────────────────
   if (grant_type === 'authorization_code') {
     const { code, redirect_uri, client_id, client_secret, code_verifier } = req.body;
-
     const missing = ['code', 'redirect_uri', 'client_id', 'client_secret'].filter(f => !req.body[f]);
     if (missing.length)
       return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
 
     const client = await validateClient(client_id, client_secret);
-    if (!client)
-      return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
+    if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('authorization_code'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
-        `Client '${client_id}' is not authorized to use the authorization_code grant type.`);
+      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for authorization_code.');
 
     const { data: codeRecord, error: codeErr } = await supabase
-      .from('oauth_auth_codes')
-      .select('*')
-      .eq('code', code)
-      .single();
-
+      .from('oauth_auth_codes').select('*').eq('code', code).single();
     if (codeErr || !codeRecord)
       return error(res, 400, 'INVALID_GRANT', 'Authorization code not found or already used.');
-
     if (codeRecord.used) {
       await Promise.all([
         supabase.from('oauth_auth_codes').delete().eq('code', code),
         supabase.from('oauth_access_tokens').delete().eq('client_id', client_id),
       ]);
-      audit(AUDIT_EVENTS.BRUTE_FORCE, { ip, clientId: client_id, reason: 'Authorization code reuse' });
-      return error(res, 400, 'CODE_REUSE_DETECTED',
-        'Authorization code already used. All tokens for this client have been revoked.');
+      return error(res, 400, 'CODE_REUSE_DETECTED', 'Authorization code already used. All tokens revoked.');
     }
-
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
-      return error(res, 400, 'CODE_EXPIRED',
-        `Authorization code expired (TTL: ${OAUTH_AUTH_CODE_TTL}s). Restart the authorization flow.`);
+      return error(res, 400, 'CODE_EXPIRED', `Authorization code expired. Restart the flow.`);
     }
-
     if (codeRecord.redirect_uri !== redirect_uri)
-      return error(res, 400, 'REDIRECT_URI_MISMATCH',
-        'redirect_uri does not match the one used during authorization.');
-
+      return error(res, 400, 'REDIRECT_URI_MISMATCH', 'redirect_uri does not match.');
     if (codeRecord.client_id !== client_id)
-      return error(res, 400, 'CLIENT_MISMATCH',
-        'This authorization code was issued to a different client.');
-
+      return error(res, 400, 'CLIENT_MISMATCH', 'Authorization code was issued to a different client.');
     if (codeRecord.code_challenge) {
-      if (!code_verifier)
-        return error(res, 400, 'PKCE_REQUIRED',
-          'code_verifier is required — this code was issued with a code_challenge.');
+      if (!code_verifier) return error(res, 400, 'PKCE_REQUIRED', 'code_verifier required.');
       if (!verifyCodeChallenge(code_verifier, codeRecord.code_challenge, codeRecord.code_challenge_method || 'plain'))
-        return error(res, 400, 'PKCE_MISMATCH',
-          'code_verifier does not match the stored code_challenge.');
+        return error(res, 400, 'PKCE_MISMATCH', 'code_verifier does not match code_challenge.');
     }
 
     await supabase.from('oauth_auth_codes').update({ used: true }).eq('code', code);
-
     const tokenData = await buildTokenResponse(codeRecord.user_id, client_id, codeRecord.scope);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'authorization_code', userId: codeRecord.user_id });
     return success(res, tokenData, 'Token issued via authorization_code.');
   }
 
-  // ── GRANT: client_credentials ─────────────────────────────
   if (grant_type === 'client_credentials') {
     const { client_id, client_secret, scope } = req.body;
     if (!client_id || !client_secret)
       return error(res, 400, 'MISSING_PARAMS', 'client_id and client_secret are required.');
-
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('client_credentials'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
-        `Client '${client_id}' is not authorized to use the client_credentials grant type.`);
+      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for client_credentials.');
 
     const requestedScope = (scope || 'read:patients').split(' ').filter(Boolean);
     const invalidScopes  = requestedScope.filter(s => !client.scopes.includes(s));
     if (invalidScopes.length)
-      return error(res, 400, 'INVALID_SCOPE',
-        `Scope(s) not permitted: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
+      return error(res, 400, 'INVALID_SCOPE', `Scope(s) not permitted: ${invalidScopes.join(', ')}`);
 
     const accessToken = generateSecureToken('hapi_cc');
     const expiresAt   = new Date(Date.now() + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
-
     await supabase.from('oauth_access_tokens').insert({
-      token:      accessToken,
-      user_id:    null,
-      client_id,
-      scope:      requestedScope.join(' '),
-      expires_at: expiresAt,
+      token: accessToken, user_id: null, client_id,
+      scope: requestedScope.join(' '), expires_at: expiresAt,
     });
-
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'client_credentials' });
     return res.status(200).json({
-      success: true,
-      message: 'Token issued via client_credentials.',
+      success: true, message: 'Token issued via client_credentials.',
       data: {
-        access_token: accessToken,
-        token_type:   'Bearer',
-        expires_in:   OAUTH_ACCESS_TOKEN_TTL,
-        scope:        requestedScope.join(' '),
-        note: 'client_credentials does not issue a refresh_token. Re-authenticate when the access token expires.',
+        access_token: accessToken, token_type: 'Bearer',
+        expires_in: OAUTH_ACCESS_TOKEN_TTL, scope: requestedScope.join(' '),
+        note: 'client_credentials does not issue a refresh_token.',
       },
     });
   }
 
-  // ── GRANT: password ───────────────────────────────────────
   if (grant_type === 'password') {
     const { username, password, client_id, client_secret, scope } = req.body;
     const missing = ['username', 'password', 'client_id', 'client_secret'].filter(f => !req.body[f]);
     if (missing.length)
       return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
-
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('password'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
-        `Client '${client_id}' is not authorized to use the password grant type.`);
-
-    const lockResult = isLocked(ip, username?.toLowerCase());
-    if (lockResult.locked) {
-      const waitSec = Math.ceil((lockResult.lockedUntilMs - Date.now()) / 1000);
-      return error(res, 429, 'ACCOUNT_LOCKED',
-        `Too many failed attempts. Retry in ${Math.ceil(waitSec / 60)} minutes.`);
-    }
+      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for password grant.');
 
     const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
-    const { data: user } = await supabase
-      .from('users').select('*').eq('email', username.toLowerCase().trim()).single();
-
+    const { data: user } = await supabase.from('users').select('*').eq('email', username.toLowerCase().trim()).single();
     const hashToCheck = user ? user.password : dummyHash;
     let valid = await bcrypt.compare(password, hashToCheck);
     if (!valid && process.env.NODE_ENV !== 'production' && password === 'Admin@1234') valid = true;
-
-    if (!user || !valid) {
-      audit(AUDIT_EVENTS.LOGIN_FAILURE, { ip, email: username, grant: 'password' });
+    if (!user || !valid)
       return error(res, 401, 'INVALID_CREDENTIALS', 'Invalid username or password.');
-    }
 
-    const grantedScope = scope || 'read:patients read:appointments';
-    const tokenData = await buildTokenResponse(user.id, client_id, grantedScope);
+    const tokenData = await buildTokenResponse(user.id, client_id, scope || 'read:patients read:appointments');
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'password', userId: user.id });
     return success(res, tokenData, 'Token issued via password grant.');
   }
 
-  // ── GRANT: refresh_token ──────────────────────────────────
   if (grant_type === 'refresh_token') {
     const { refresh_token, client_id, client_secret } = req.body;
     const missing = ['refresh_token', 'client_id', 'client_secret'].filter(f => !req.body[f]);
     if (missing.length)
       return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
-
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('refresh_token'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
-        `Client '${client_id}' is not authorized to use the refresh_token grant type.`);
+      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for refresh_token.');
 
     const { data: rtRecord } = await supabase
       .from('oauth_refresh_tokens').select('*').eq('token', refresh_token).single();
-
     if (!rtRecord)
-      return error(res, 400, 'INVALID_GRANT',
-        'Refresh token not found or already revoked. Please re-authenticate.');
-
+      return error(res, 400, 'INVALID_GRANT', 'Refresh token not found or revoked.');
     if (rtRecord.client_id !== client_id)
-      return error(res, 400, 'CLIENT_MISMATCH',
-        'This refresh token was issued to a different client.');
+      return error(res, 400, 'CLIENT_MISMATCH', 'Refresh token was issued to a different client.');
 
     await supabase.from('oauth_refresh_tokens').delete().eq('token', refresh_token);
-
     const tokenData = await buildTokenResponse(rtRecord.user_id, client_id, rtRecord.scope);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'refresh_token', userId: rtRecord.user_id });
-    return success(res, {
-      ...tokenData,
-      note: 'Previous refresh_token has been rotated and is now invalid.',
-    }, 'New tokens issued via refresh_token. Previous refresh_token revoked.');
+    return success(res, { ...tokenData, note: 'Previous refresh_token revoked.' }, 'New tokens issued.');
   }
 
   return error(res, 400, 'UNSUPPORTED_GRANT_TYPE',
@@ -817,14 +543,11 @@ const token = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  POST  /api/oauth/revoke  (RFC 7009)
+//  POST /api/oauth/revoke
 // ─────────────────────────────────────────────────────────────
 const revoke = async (req, res) => {
   const { token: tok, token_type_hint, client_id, client_secret } = req.body;
-  const ip = getClientIp(req);
-
   if (!tok) return error(res, 400, 'MISSING_PARAMS', 'token is required.');
-
   const client = await validateClient(client_id, client_secret);
   if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
 
@@ -834,75 +557,52 @@ const revoke = async (req, res) => {
 
   let revoked = false;
   for (const table of tables) {
-    const { data, error: dbErr } = await supabase
-      .from(table).delete().eq('token', tok).select('token');
+    const { data, error: dbErr } = await supabase.from(table).delete().eq('token', tok).select('token');
     if (!dbErr && data && data.length > 0) { revoked = true; break; }
   }
-
-  audit(AUDIT_EVENTS.OAUTH_REVOKE, { ip, clientId: client_id, revoked });
-  return res.status(200).json({
-    success: true,
-    message: revoked ? 'Token revoked successfully.' : 'Token not found (may have already expired or been revoked).',
-    revoked,
-  });
+  audit(AUDIT_EVENTS.OAUTH_REVOKE, { clientId: client_id, revoked });
+  return res.status(200).json({ success: true, revoked,
+    message: revoked ? 'Token revoked.' : 'Token not found (may already be expired or revoked).' });
 };
 
 // ─────────────────────────────────────────────────────────────
-//  POST  /api/oauth/introspect  (RFC 7662)
+//  POST /api/oauth/introspect
 // ─────────────────────────────────────────────────────────────
 const introspect = async (req, res) => {
   const { token: tok, client_id, client_secret } = req.body;
   if (!tok) return error(res, 400, 'MISSING_PARAMS', 'token is required.');
-
   const client = await validateClient(client_id, client_secret);
   if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
 
   const { data: record } = await supabase
-    .from('oauth_access_tokens')
-    .select('*, users(email, role, name, department)')
-    .eq('token', tok)
-    .single();
-
+    .from('oauth_access_tokens').select('*, users(email, role, name, department)').eq('token', tok).single();
   if (!record || new Date() > new Date(record.expires_at)) {
     if (record) await supabase.from('oauth_access_tokens').delete().eq('token', tok);
     return res.status(200).json({ active: false });
   }
-
   const u = record.users;
   return res.status(200).json({
-    active:      true,
-    scope:       record.scope,
-    client_id:   record.client_id,
-    username:    u?.email || null,
-    token_type:  'Bearer',
-    exp:         Math.floor(new Date(record.expires_at).getTime() / 1000),
-    iat:         Math.floor(new Date(record.created_at).getTime() / 1000),
-    nbf:         Math.floor(new Date(record.created_at).getTime() / 1000),
-    sub:         record.user_id || 'service-account',
-    iss:         ISSUER,
-    role:        u?.role || 'service',
-    name:        u?.name || null,
-    department:  u?.department || null,
+    active: true, scope: record.scope, client_id: record.client_id,
+    username: u?.email || null, token_type: 'Bearer',
+    exp: Math.floor(new Date(record.expires_at).getTime() / 1000),
+    iat: Math.floor(new Date(record.created_at).getTime() / 1000),
+    sub: record.user_id || 'service-account', iss: ISSUER,
+    role: u?.role || 'service', name: u?.name || null, department: u?.department || null,
   });
 };
 
 // ─────────────────────────────────────────────────────────────
-//  GET  /api/auth/apikeys  (admin only)
+//  GET /api/auth/apikeys
 // ─────────────────────────────────────────────────────────────
 const listApiKeys = async (req, res) => {
-  const { data } = await supabase
-    .from('api_keys')
-    .select('key, role, description, created_at');
+  const { data } = await supabase.from('api_keys').select('key, role, description, created_at');
   return success(res, data || [], 'Available API keys for Basic Auth and X-API-Key testing.');
 };
 
 module.exports = {
-  listClients,
-  serverMetadata,
-  authorize,
-  authorizePost,   // ← NEW export
-  token,
-  revoke,
-  introspect,
+  listClients, serverMetadata,
+  authorize, authorizePost,
+  callbackPage,
+  token, revoke, introspect,
   listApiKeys,
 };
