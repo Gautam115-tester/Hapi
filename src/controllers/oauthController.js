@@ -11,8 +11,13 @@
 //  USE THIS as your redirect_uri in Postman:
 //    https://hapi-2115.onrender.com/api/oauth/callback
 //
-//  FIX: authorizePost now checks both `users` AND `api_tester_accounts`
-//       so registered testers can log in with their own credentials.
+//  FIX 1: authorizePost now checks both `users` AND `api_tester_accounts`
+//         so registered testers can log in with their own credentials.
+//
+//  FIX 2: token endpoint now accepts client credentials via
+//         Authorization: Basic base64(client_id:client_secret)
+//         in addition to request body — RFC 6749 §2.3.1 compliant.
+//         Postman's built-in OAuth2 flow sends Basic Auth by default.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -32,6 +37,33 @@ const {
 } = require('../utils/authSecurity');
 
 const ISSUER = BASE_URL || 'https://hapi-2115.onrender.com';
+
+// ── Extract client credentials from Basic Auth header OR body ─
+// RFC 6749 §2.3.1: clients MAY send credentials via HTTP Basic Auth
+// on the token endpoint. Postman's built-in OAuth2 flow does this by
+// default ("Send as Basic Auth header" option). Support both methods.
+const extractClientCredentials = (req) => {
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Basic ')) {
+    try {
+      const decoded  = Buffer.from(authHeader.slice(6), 'base64').toString('utf-8');
+      const colonIdx = decoded.indexOf(':');
+      if (colonIdx !== -1) {
+        return {
+          client_id:     decodeURIComponent(decoded.slice(0, colonIdx)),
+          client_secret: decodeURIComponent(decoded.slice(colonIdx + 1)),
+        };
+      }
+    } catch (_) {
+      // malformed Basic header — fall through to body
+    }
+  }
+  // Fall back to body fields (works when Postman uses "Send in body")
+  return {
+    client_id:     req.body.client_id,
+    client_secret: req.body.client_secret,
+  };
+};
 
 // ── Client credential validation ─────────────────────────────
 const validateClient = async (clientId, clientSecret) => {
@@ -439,16 +471,22 @@ const callbackPage = (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/token  — All 4 grant types
+//  FIX: client credentials now extracted from Basic Auth header
+//       OR request body — whichever is present (RFC 6749 §2.3.1)
 // ─────────────────────────────────────────────────────────────
 const token = async (req, res) => {
   const { grant_type } = req.body;
   const ip = getClientIp(req);
 
+  // ── authorization_code ────────────────────────────────────
   if (grant_type === 'authorization_code') {
-    const { code, redirect_uri, client_id, client_secret, code_verifier } = req.body;
-    const missing = ['code', 'redirect_uri', 'client_id', 'client_secret'].filter(f => !req.body[f]);
-    if (missing.length)
-      return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
+    const { code, redirect_uri, code_verifier } = req.body;
+    const { client_id, client_secret } = extractClientCredentials(req);
+
+    if (!code || !redirect_uri)
+      return error(res, 400, 'MISSING_PARAMS', 'Required fields missing: code, redirect_uri');
+    if (!client_id || !client_secret)
+      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
@@ -468,7 +506,7 @@ const token = async (req, res) => {
     }
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
-      return error(res, 400, 'CODE_EXPIRED', `Authorization code expired. Restart the flow.`);
+      return error(res, 400, 'CODE_EXPIRED', 'Authorization code expired. Restart the flow.');
     }
     if (codeRecord.redirect_uri !== redirect_uri)
       return error(res, 400, 'REDIRECT_URI_MISMATCH', 'redirect_uri does not match.');
@@ -486,10 +524,14 @@ const token = async (req, res) => {
     return success(res, tokenData, 'Token issued via authorization_code.');
   }
 
+  // ── client_credentials ────────────────────────────────────
   if (grant_type === 'client_credentials') {
-    const { client_id, client_secret, scope } = req.body;
+    const { scope } = req.body;
+    const { client_id, client_secret } = extractClientCredentials(req);
+
     if (!client_id || !client_secret)
-      return error(res, 400, 'MISSING_PARAMS', 'client_id and client_secret are required.');
+      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
+
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('client_credentials'))
@@ -517,11 +559,16 @@ const token = async (req, res) => {
     });
   }
 
+  // ── password ──────────────────────────────────────────────
   if (grant_type === 'password') {
-    const { username, password, client_id, client_secret, scope } = req.body;
-    const missing = ['username', 'password', 'client_id', 'client_secret'].filter(f => !req.body[f]);
-    if (missing.length)
-      return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
+    const { username, password, scope } = req.body;
+    const { client_id, client_secret } = extractClientCredentials(req);
+
+    if (!username || !password)
+      return error(res, 400, 'MISSING_PARAMS', 'Required fields missing: username, password');
+    if (!client_id || !client_secret)
+      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
+
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('password'))
@@ -541,11 +588,16 @@ const token = async (req, res) => {
     return success(res, tokenData, 'Token issued via password grant.');
   }
 
+  // ── refresh_token ─────────────────────────────────────────
   if (grant_type === 'refresh_token') {
-    const { refresh_token, client_id, client_secret } = req.body;
-    const missing = ['refresh_token', 'client_id', 'client_secret'].filter(f => !req.body[f]);
-    if (missing.length)
-      return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
+    const { refresh_token } = req.body;
+    const { client_id, client_secret } = extractClientCredentials(req);
+
+    if (!refresh_token)
+      return error(res, 400, 'MISSING_PARAMS', 'Required field missing: refresh_token');
+    if (!client_id || !client_secret)
+      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
+
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('refresh_token'))
@@ -572,7 +624,9 @@ const token = async (req, res) => {
 //  POST /api/oauth/revoke
 // ─────────────────────────────────────────────────────────────
 const revoke = async (req, res) => {
-  const { token: tok, token_type_hint, client_id, client_secret } = req.body;
+  const { token: tok, token_type_hint } = req.body;
+  const { client_id, client_secret } = extractClientCredentials(req);
+
   if (!tok) return error(res, 400, 'MISSING_PARAMS', 'token is required.');
   const client = await validateClient(client_id, client_secret);
   if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
@@ -595,7 +649,9 @@ const revoke = async (req, res) => {
 //  POST /api/oauth/introspect
 // ─────────────────────────────────────────────────────────────
 const introspect = async (req, res) => {
-  const { token: tok, client_id, client_secret } = req.body;
+  const { token: tok } = req.body;
+  const { client_id, client_secret } = extractClientCredentials(req);
+
   if (!tok) return error(res, 400, 'MISSING_PARAMS', 'token is required.');
   const client = await validateClient(client_id, client_secret);
   if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
