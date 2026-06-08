@@ -10,15 +10,6 @@
 //    client_credentials  — machine-to-machine
 //    password            — legacy / testing only (can be disabled per client)
 //    refresh_token       — with rotation
-//
-//  Security improvements over v1:
-//    - PKCE S256 required for auth-code flow with public clients
-//    - code_challenge stored and verified (not skippable)
-//    - Authorization codes are single-use + expire in 5 min
-//    - Access tokens: scoped, per-client
-//    - Refresh tokens: rotate on use, revoke family on reuse
-//    - Introspection returns RFC 7662 compliant response
-//    - All token ops audit-logged
 // ============================================================
 
 const crypto   = require('crypto');
@@ -49,7 +40,6 @@ const validateClient = async (clientId, clientSecret) => {
     .single();
 
   if (!data) return null;
-  // Constant-time compare
   const buf1 = Buffer.from(data.client_secret);
   const buf2 = Buffer.from(String(clientSecret));
   if (buf1.length !== buf2.length) return null;
@@ -106,7 +96,6 @@ const buildTokenResponse = async (userId, clientId, scope) => {
     expires_in:    OAUTH_ACCESS_TOKEN_TTL,
     refresh_token: refreshToken,
     scope,
-    // RFC 7519-style metadata (for client convenience, not a signed JWT)
     token_metadata: {
       issued_at:  new Date(now).toISOString(),
       expires_at: atExpiry,
@@ -119,7 +108,6 @@ const buildTokenResponse = async (userId, clientId, scope) => {
 
 // ─────────────────────────────────────────────────────────────
 //  GET  /api/oauth/.well-known/oauth-authorization-server
-//  RFC 8414 — Server Metadata
 // ─────────────────────────────────────────────────────────────
 const serverMetadata = (req, res) => res.status(200).json({
   issuer:                                ISSUER,
@@ -127,7 +115,7 @@ const serverMetadata = (req, res) => res.status(200).json({
   token_endpoint:                        `${ISSUER}/api/oauth/token`,
   revocation_endpoint:                   `${ISSUER}/api/oauth/revoke`,
   introspection_endpoint:                `${ISSUER}/api/oauth/introspect`,
-  jwks_uri:                              null, // HMAC-signed — no JWKS
+  jwks_uri:                              null,
   response_types_supported:             ['code'],
   grant_types_supported:                ['authorization_code', 'client_credentials', 'password', 'refresh_token'],
   token_endpoint_auth_methods_supported:['client_secret_post', 'client_secret_basic'],
@@ -170,13 +158,11 @@ const authorize = async (req, res) => {
     code_challenge_method,
   } = req.query;
 
-  // ── Validate response_type ────────────────────────────────
   if (response_type !== 'code') {
     return error(res, 400, 'UNSUPPORTED_RESPONSE_TYPE',
-      'response_type must be "code". Only the Authorization Code grant is supported here.');
+      'response_type must be "code".');
   }
 
-  // ── Validate client ────────────────────────────────────────
   if (!client_id) {
     return error(res, 400, 'MISSING_CLIENT_ID', 'client_id is required.');
   }
@@ -189,10 +175,9 @@ const authorize = async (req, res) => {
 
   if (!client) {
     return error(res, 401, 'INVALID_CLIENT',
-      `No registered OAuth2 client with client_id: ${client_id}. Use GET /api/oauth/clients to list registered clients.`);
+      `No registered OAuth2 client with client_id: ${client_id}.`);
   }
 
-  // ── Validate redirect_uri ─────────────────────────────────
   if (!redirect_uri) {
     return error(res, 400, 'MISSING_REDIRECT_URI', 'redirect_uri is required.');
   }
@@ -201,23 +186,20 @@ const authorize = async (req, res) => {
       `redirect_uri '${redirect_uri}' is not registered for this client. Registered: ${client.redirect_uris.join(', ')}`);
   }
 
-  // ── Validate scopes ───────────────────────────────────────
   const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
   const invalidScopes   = requestedScopes.filter(s => !client.scopes.includes(s));
   if (invalidScopes.length > 0) {
     return error(res, 400, 'INVALID_SCOPE',
-      `The following scopes are not permitted for this client: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
+      `Scopes not permitted: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
   }
 
-  // ── PKCE validation ───────────────────────────────────────
   if (code_challenge) {
     const method = code_challenge_method || 'plain';
     if (!['S256', 'plain'].includes(method)) {
       return error(res, 400, 'INVALID_CODE_CHALLENGE_METHOD',
-        'code_challenge_method must be S256 or plain. S256 is strongly recommended.');
+        'code_challenge_method must be S256 or plain.');
     }
     if (method === 'plain') {
-      // Warn but allow (some legacy clients can't do S256)
       console.warn('[OAUTH] Client using PKCE plain method — S256 strongly preferred.');
     }
   }
@@ -228,14 +210,14 @@ const authorize = async (req, res) => {
 
   await supabase.from('oauth_auth_codes').insert({
     code,
-    user_id:              'usr_001',  // In real app: authenticated user's ID
+    user_id:               'usr_001',
     client_id,
-    scope:                requestedScopes.join(' '),
+    scope:                 requestedScopes.join(' '),
     redirect_uri,
-    expires_at:           expiresAt,
-    code_challenge:       code_challenge || null,
+    expires_at:            expiresAt,
+    code_challenge:        code_challenge || null,
     code_challenge_method: code_challenge_method || null,
-    used:                 false,
+    used:                  false,
   });
 
   const ip = getClientIp(req);
@@ -245,31 +227,12 @@ const authorize = async (req, res) => {
     scope: requestedScopes.join(' '),
   });
 
-  return res.status(200).json({
-    success: true,
-    message: 'Authorization code issued.',
-    data: {
-      code,
-      state:              state || null,
-      redirect_uri,
-      expires_in_seconds: OAUTH_AUTH_CODE_TTL,
-      simulated_redirect: `${redirect_uri}?code=${code}${state ? `&state=${encodeURIComponent(state)}` : ''}`,
-      next_step: {
-        description: 'Exchange this code for tokens at POST /api/oauth/token',
-        method:  'POST',
-        url:     `${ISSUER}/api/oauth/token`,
-        content_type: 'application/json',
-        body: {
-          grant_type:    'authorization_code',
-          code,
-          redirect_uri,
-          client_id,
-          client_secret: '<your_client_secret>',
-          ...(code_challenge ? { code_verifier: '<the_verifier_you_used_to_generate_the_challenge>' } : {}),
-        },
-      },
-    },
-  });
+  // ── Real 302 redirect — Postman OAuth popup intercepts this ──
+  const callbackUrl = new URL(redirect_uri);
+  callbackUrl.searchParams.set('code', code);
+  if (state) callbackUrl.searchParams.set('state', state);
+
+  return res.redirect(302, callbackUrl.toString());
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -291,7 +254,6 @@ const token = async (req, res) => {
       return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
     }
 
-    // Validate client
     const client = await validateClient(client_id, client_secret);
     if (!client) {
       return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
@@ -301,7 +263,6 @@ const token = async (req, res) => {
         `Client '${client_id}' is not authorized to use the authorization_code grant type.`);
     }
 
-    // Fetch code record
     const { data: codeRecord, error: codeErr } = await supabase
       .from('oauth_auth_codes')
       .select('*')
@@ -309,12 +270,10 @@ const token = async (req, res) => {
       .single();
 
     if (codeErr || !codeRecord) {
-      return error(res, 400, 'INVALID_GRANT', 'Authorization code not found or has already been used.');
+      return error(res, 400, 'INVALID_GRANT', 'Authorization code not found or already used.');
     }
 
-    // Code already used — possible authorization code injection attack
     if (codeRecord.used) {
-      // Invalidate all tokens issued to this client as a precaution
       await Promise.all([
         supabase.from('oauth_auth_codes').delete().eq('code', code),
         supabase.from('oauth_access_tokens').delete().eq('client_id', client_id),
@@ -323,41 +282,36 @@ const token = async (req, res) => {
         ip, clientId: client_id, reason: 'Authorization code reuse detected',
       });
       return error(res, 400, 'CODE_REUSE_DETECTED',
-        'Authorization code has already been used. All tokens for this client have been revoked for security.');
+        'Authorization code already used. All tokens for this client have been revoked.');
     }
 
-    // Code expired
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
       return error(res, 400, 'CODE_EXPIRED',
-        `Authorization code has expired (TTL: ${OAUTH_AUTH_CODE_TTL}s). Please restart the authorization flow.`);
+        `Authorization code expired (TTL: ${OAUTH_AUTH_CODE_TTL}s). Restart the authorization flow.`);
     }
 
-    // redirect_uri must match
     if (codeRecord.redirect_uri !== redirect_uri) {
       return error(res, 400, 'REDIRECT_URI_MISMATCH',
         'redirect_uri does not match the one used during authorization.');
     }
 
-    // client_id must match
     if (codeRecord.client_id !== client_id) {
       return error(res, 400, 'CLIENT_MISMATCH',
         'This authorization code was issued to a different client.');
     }
 
-    // ── PKCE verification ─────────────────────────────────
     if (codeRecord.code_challenge) {
       if (!code_verifier) {
         return error(res, 400, 'PKCE_REQUIRED',
-          'code_verifier is required — this authorization code was issued with a code_challenge (PKCE).');
+          'code_verifier is required — this code was issued with a code_challenge.');
       }
       if (!verifyCodeChallenge(code_verifier, codeRecord.code_challenge, codeRecord.code_challenge_method || 'plain')) {
         return error(res, 400, 'PKCE_MISMATCH',
-          'code_verifier does not match the stored code_challenge. Ensure you are using the same verifier that generated the challenge.');
+          'code_verifier does not match the stored code_challenge.');
       }
     }
 
-    // ── Mark code as used (before issuing tokens — atomic-ish) ──
     await supabase.from('oauth_auth_codes').update({ used: true }).eq('code', code);
 
     const tokenData = await buildTokenResponse(codeRecord.user_id, client_id, codeRecord.scope);
@@ -367,13 +321,13 @@ const token = async (req, res) => {
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  GRANT: client_credentials  (machine-to-machine)
+  //  GRANT: client_credentials
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (grant_type === 'client_credentials') {
     const { client_id, client_secret, scope } = req.body;
 
     if (!client_id || !client_secret) {
-      return error(res, 400, 'MISSING_PARAMS', 'client_id and client_secret are required for client_credentials.');
+      return error(res, 400, 'MISSING_PARAMS', 'client_id and client_secret are required.');
     }
 
     const client = await validateClient(client_id, client_secret);
@@ -388,16 +342,15 @@ const token = async (req, res) => {
     const invalidScopes  = requestedScope.filter(s => !client.scopes.includes(s));
     if (invalidScopes.length) {
       return error(res, 400, 'INVALID_SCOPE',
-        `Scope(s) not permitted for this client: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
+        `Scope(s) not permitted: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
     }
 
-    // client_credentials issues access token only (no refresh token per spec)
     const accessToken = generateSecureToken('hapi_cc');
     const expiresAt   = new Date(Date.now() + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
 
     await supabase.from('oauth_access_tokens').insert({
       token:      accessToken,
-      user_id:    null,  // No user for client_credentials
+      user_id:    null,
       client_id,
       scope:      requestedScope.join(' '),
       expires_at: expiresAt,
@@ -413,14 +366,13 @@ const token = async (req, res) => {
         token_type:   'Bearer',
         expires_in:   OAUTH_ACCESS_TOKEN_TTL,
         scope:        requestedScope.join(' '),
-        // No refresh_token — per RFC 6749 §4.4.3
         note: 'client_credentials does not issue a refresh_token. Re-authenticate when the access token expires.',
       },
     });
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  GRANT: password  (Resource Owner Password — legacy)
+  //  GRANT: password
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (grant_type === 'password') {
     const { username, password, client_id, client_secret, scope } = req.body;
@@ -438,7 +390,6 @@ const token = async (req, res) => {
         `Client '${client_id}' is not authorized to use the password grant type.`);
     }
 
-    // Brute-force check
     const lockResult = isLocked(ip, username?.toLowerCase());
     if (lockResult.locked) {
       const waitSec = Math.ceil((lockResult.lockedUntilMs - Date.now()) / 1000);
@@ -496,7 +447,7 @@ const token = async (req, res) => {
 
     if (!rtRecord) {
       return error(res, 400, 'INVALID_GRANT',
-        'Refresh token not found or has already been revoked. Please re-authenticate.');
+        'Refresh token not found or already revoked. Please re-authenticate.');
     }
 
     if (rtRecord.client_id !== client_id) {
@@ -504,7 +455,6 @@ const token = async (req, res) => {
         'This refresh token was issued to a different client.');
     }
 
-    // ── Rotate: delete old, issue new ─────────────────────
     await supabase.from('oauth_refresh_tokens').delete().eq('token', refresh_token);
 
     const tokenData = await buildTokenResponse(rtRecord.user_id, client_id, rtRecord.scope);
@@ -518,7 +468,6 @@ const token = async (req, res) => {
     }, 'New tokens issued via refresh_token. Previous refresh_token revoked.');
   }
 
-  // ── Unknown grant type ────────────────────────────────────
   return error(res, 400, 'UNSUPPORTED_GRANT_TYPE',
     `grant_type '${grant_type}' is not supported. Supported: authorization_code, client_credentials, password, refresh_token.`);
 };
@@ -535,7 +484,6 @@ const revoke = async (req, res) => {
   const client = await validateClient(client_id, client_secret);
   if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
 
-  // RFC 7009: try the hinted type first, then the other
   const tables = token_type_hint === 'refresh_token'
     ? ['oauth_refresh_tokens', 'oauth_access_tokens']
     : ['oauth_access_tokens', 'oauth_refresh_tokens'];
@@ -552,7 +500,6 @@ const revoke = async (req, res) => {
 
   audit(AUDIT_EVENTS.OAUTH_REVOKE, { ip, clientId: client_id, revoked });
 
-  // RFC 7009 §2.2: Always return 200, even if token didn't exist
   return res.status(200).json({
     success: true,
     message: revoked ? 'Token revoked successfully.' : 'Token not found (may have already expired or been revoked).',
@@ -577,10 +524,8 @@ const introspect = async (req, res) => {
     .eq('token', tok)
     .single();
 
-  // RFC 7662 §2.2: inactive response for missing/expired tokens
   if (!record || new Date() > new Date(record.expires_at)) {
     if (record) {
-      // Clean up expired token
       await supabase.from('oauth_access_tokens').delete().eq('token', tok);
     }
     return res.status(200).json({ active: false });
@@ -598,7 +543,6 @@ const introspect = async (req, res) => {
     nbf:         Math.floor(new Date(record.created_at).getTime() / 1000),
     sub:         record.user_id || 'service-account',
     iss:         ISSUER,
-    // Extended (non-RFC) claims for HealthAPI clients
     role:        u?.role || 'service',
     name:        u?.name || null,
     department:  u?.department || null,

@@ -32,7 +32,6 @@ const {
 const ISSUER   = BASE_URL || 'https://healthapi.onrender.com';
 const AUDIENCE = 'healthapi-clients';
 
-// ── Timing-safe token comparison ─────────────────────────────
 const safeCompare = (a, b) => {
   const bufA = Buffer.from(String(a));
   const bufB = Buffer.from(String(b));
@@ -54,7 +53,6 @@ const authenticate = async (req, res, next) => {
   if (authHeader.startsWith('Basic '))  return handleBasic(req, res, next, authHeader);
   if (apiKeyHeader)                     return handleApiKeyHeader(req, res, next, apiKeyHeader);
 
-  const ip = getClientIp(req);
   audit(AUDIT_EVENTS.UNAUTHORIZED, { path: req.path, method: req.method });
 
   return res.status(401)
@@ -81,12 +79,41 @@ const authenticate = async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────
 const handleBearer = async (req, res, next, authHeader) => {
   const token = authHeader.slice(7).trim();
-  const ip    = getClientIp(req);
 
   if (!token) {
     return res.status(401)
       .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_request', 'Bearer token is empty.'))
       .json({ success: false, error: { code: 'MISSING_TOKEN', message: 'Bearer token is empty.' } });
+  }
+
+  // ── Detect tester session JWT early — reject with helpful message ──
+  try {
+    const peeked = jwt.decode(token);
+    if (peeked && peeked.type === 'tester') {
+      return res.status(401)
+        .set('WWW-Authenticate', wwwAuthenticate.bearer(ISSUER, 'invalid_token', 'Wrong token type.'))
+        .json({
+          success: false,
+          error: {
+            code:    'WRONG_TOKEN_TYPE',
+            message: 'The session token from POST /api/register is only valid for GET /api/register/me. To access API resources you need an OAuth access token.',
+            howToFix: {
+              description: 'Call POST /api/oauth/token with your client credentials to get an access token',
+              method:      'POST',
+              url:         `${ISSUER}/api/oauth/token`,
+              body: {
+                grant_type:    'client_credentials',
+                client_id:     '<your client_id from registration>',
+                client_secret: '<your client_secret from registration>',
+                scope:         'read:patients write:patients read:appointments',
+              },
+              then: 'Use the returned access_token as: Authorization: Bearer <access_token>',
+            },
+          },
+        });
+    }
+  } catch (_) {
+    // not a JWT — fall through
   }
 
   // ── A. Try JWT (3 dot-separated segments) ────────────────
@@ -123,8 +150,8 @@ const handleBearer = async (req, res, next, authHeader) => {
           .json({
             success: false,
             error: {
-              code:    'TOKEN_EXPIRED',
-              message: 'JWT has expired. Use POST /api/auth/refresh to get a new one.',
+              code:      'TOKEN_EXPIRED',
+              message:   'JWT has expired. Use POST /api/auth/refresh to get a new one.',
               expiredAt: err.expiredAt,
             },
           });
@@ -220,7 +247,6 @@ const handleBasic = async (req, res, next, authHeader) => {
       .json({ success: false, error: { code: 'MISSING_CREDENTIAL', message: 'Credential field is empty.' } });
   }
 
-  // ── Brute-force check (email only — no IP) ───────────────
   const lockCheck = isLocked(ip, username);
   if (lockCheck.locked) {
     const waitSec = Math.ceil((lockCheck.lockedUntilMs - Date.now()) / 1000);
@@ -280,7 +306,6 @@ const handleBasic = async (req, res, next, authHeader) => {
   const hashToCheck = user ? user.password : dummyHash;
   let valid = await bcrypt.compare(credential, hashToCheck);
 
-  // Dev-mode plaintext fallback
   if (!valid && process.env.NODE_ENV !== 'production' && credential === 'Admin@1234') {
     valid = true;
   }
@@ -406,7 +431,7 @@ const requireScope = (scope) => (req, res, next) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  OPTIONAL AUTH  (sets req.user if token present, never 401s)
+//  OPTIONAL AUTH
 // ─────────────────────────────────────────────────────────────
 const optionalAuth = async (req, res, next) => {
   const authHeader = req.headers['authorization'] || '';

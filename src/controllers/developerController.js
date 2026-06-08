@@ -19,10 +19,9 @@ const supabase = require('../utils/db');
 const { JWT_SECRET, JWT_EXPIRES_IN, BASE_URL } = require('../utils/config');
 const { success, error } = require('../utils/response');
 
-const ISSUER  = BASE_URL || 'https://hapi-2115.onrender.com';
+const ISSUER  = BASE_URL || 'https://healthapi.onrender.com';
 const API_VER = 'v2.0';
 
-// ── Helpers ───────────────────────────────────────────────────
 const generateClientId = (fullName) => {
   const slug = fullName
     .toLowerCase()
@@ -89,7 +88,6 @@ const buildIntegrationGuide = (clientId, clientSecret) => ({
 const register = async (req, res) => {
   const { fullName, email, password, organisation, role } = req.body;
 
-  // Validation
   const missing = ['fullName', 'email', 'password', 'organisation', 'role']
     .filter(f => !req.body[f]);
   if (missing.length)
@@ -107,7 +105,6 @@ const register = async (req, res) => {
     return error(res, 422, 'VALIDATION_ERROR',
       `Invalid role. Accepted values: ${allowedRoles.join(', ')}.`);
 
-  // Duplicate check
   const { data: existing } = await supabase
     .from('api_tester_accounts')
     .select('id')
@@ -118,13 +115,10 @@ const register = async (req, res) => {
     return error(res, 409, 'ACCOUNT_EXISTS',
       `An access account is already registered under ${email}. Please authenticate via POST /api/register/login.`);
 
-  // Generate credentials
   const hashedPassword = await bcrypt.hash(password, 10);
   const clientId       = generateClientId(fullName);
   const clientSecret   = generateClientSecret();
-  const issuedAt       = new Date().toISOString();
 
-  // Persist account
   const { data: account, error: dbErr } = await supabase
     .from('api_tester_accounts')
     .insert({
@@ -141,12 +135,17 @@ const register = async (req, res) => {
 
   if (dbErr) return error(res, 500, 'DB_ERROR', dbErr.message);
 
-  // Register as live OAuth client
+  // Register as live OAuth client — all 4 callback URIs included
   await supabase.from('oauth_clients').insert({
     client_id:     clientId,
     client_secret: clientSecret,
     name:          `${fullName.trim()} · ${organisation.trim()}`,
-    redirect_uris: ['https://oauth.pstmn.io/v1/callback', 'http://localhost:3000/callback'],
+    redirect_uris: [
+      'https://oauth.pstmn.io/v1/callback',
+      'http://localhost:3000/callback',
+      'http://localhost:3000/api/oauth/callback',
+      `${ISSUER}/api/oauth/callback`,
+    ],
     grant_types:   ['authorization_code', 'client_credentials', 'refresh_token', 'password'],
     scopes:        ['read:patients', 'write:patients', 'read:appointments',
                     'write:appointments', 'read:records', 'admin'],
@@ -178,7 +177,24 @@ const register = async (req, res) => {
       token:      sessionToken,
       token_type: 'Bearer',
       expires_in: JWT_EXPIRES_IN,
-      usage:      'Use this token in Authorization: Bearer <token> to access GET /api/register/me',
+      usage:      'Use this token in Authorization: Bearer <token> to access GET /api/register/me only. To access patient/appointment data, use the OAuth access token from step below.',
+    },
+
+    how_to_access_api: {
+      description: 'Use client_credentials grant to get an OAuth access token for all API endpoints',
+      step1: {
+        method:  'POST',
+        url:     `${ISSUER}/api/oauth/token`,
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          grant_type:    'client_credentials',
+          client_id:     clientId,
+          client_secret: clientSecret,
+          scope:         'read:patients write:patients read:appointments',
+        },
+      },
+      step2: 'Copy access_token from the response',
+      step3: `Use it on any endpoint: GET ${ISSUER}/api/patients  →  Authorization: Bearer <access_token>`,
     },
 
     important_notice: [
@@ -245,6 +261,24 @@ const login = async (req, res) => {
       token:      sessionToken,
       token_type: 'Bearer',
       expires_in: JWT_EXPIRES_IN,
+      usage:      'Use this token in Authorization: Bearer <token> to access GET /api/register/me only. To access patient/appointment data, use the OAuth access token from step below.',
+    },
+
+    how_to_access_api: {
+      description: 'Use client_credentials grant to get an OAuth access token for all API endpoints',
+      step1: {
+        method:  'POST',
+        url:     `${ISSUER}/api/oauth/token`,
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          grant_type:    'client_credentials',
+          client_id:     account.client_id,
+          client_secret: account.client_secret,
+          scope:         'read:patients write:patients read:appointments',
+        },
+      },
+      step2: 'Copy access_token from the response',
+      step3: `Use it on any endpoint: GET ${ISSUER}/api/patients  →  Authorization: Bearer <access_token>`,
     },
   }, 'Authentication successful. Your integration credentials are listed below.');
 };
@@ -280,6 +314,22 @@ const me = async (req, res) => {
     access_credentials: buildAccessBlock(account.client_id, account.client_secret),
 
     integration_guide: buildIntegrationGuide(account.client_id, account.client_secret),
+
+    how_to_access_api: {
+      description: 'Use client_credentials grant to get an OAuth access token for all API endpoints',
+      step1: {
+        method:  'POST',
+        url:     `${ISSUER}/api/oauth/token`,
+        body: {
+          grant_type:    'client_credentials',
+          client_id:     account.client_id,
+          client_secret: account.client_secret,
+          scope:         'read:patients write:patients read:appointments',
+        },
+      },
+      step2: 'Copy access_token from the response',
+      step3: `Use it on any endpoint: GET ${ISSUER}/api/patients  →  Authorization: Bearer <access_token>`,
+    },
   }, 'Active integration credentials for your account.');
 };
 
@@ -296,8 +346,8 @@ const regenerateSecret = async (req, res) => {
   if (!account)
     return error(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found.');
 
-  const newSecret   = generateClientSecret();
-  const rotatedAt   = new Date().toISOString();
+  const newSecret = generateClientSecret();
+  const rotatedAt = new Date().toISOString();
 
   await Promise.all([
     supabase.from('api_tester_accounts')
@@ -326,7 +376,7 @@ const regenerateSecret = async (req, res) => {
     security_notice: {
       rotated_at:      rotatedAt,
       previous_secret: 'INVALIDATED',
-      action_required: 'Update your client_secret immediately in all integration configurations. All active tokens issued under the previous secret will be rejected on next use.',
+      action_required: 'Update your client_secret immediately in all integration configurations.',
     },
   }, 'Client secret rotated. Previous secret has been invalidated immediately.');
 };
