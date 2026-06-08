@@ -8,8 +8,12 @@
 //  Grant types:
 //    authorization_code  — with PKCE (S256 required for public clients)
 //    client_credentials  — machine-to-machine
-//    password            — legacy / testing only (can be disabled per client)
+//    password            — legacy / testing only
 //    refresh_token       — with rotation
+//
+//  FIX: /authorize now serves an HTML login page instead of
+//       blindly redirecting. This makes Postman's OAuth 2.0
+//       popup (both desktop app and web app) work correctly.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -56,9 +60,7 @@ const verifyCodeChallenge = (verifier, challenge, method) => {
       .digest('base64url');
     return expected === challenge;
   }
-  if (method === 'plain') {
-    return verifier === challenge;
-  }
+  if (method === 'plain') return verifier === challenge;
   return false;
 };
 
@@ -120,13 +122,9 @@ const serverMetadata = (req, res) => res.status(200).json({
   grant_types_supported:                ['authorization_code', 'client_credentials', 'password', 'refresh_token'],
   token_endpoint_auth_methods_supported:['client_secret_post', 'client_secret_basic'],
   scopes_supported: [
-    'read:patients',
-    'write:patients',
-    'read:appointments',
-    'write:appointments',
-    'read:records',
-    'write:records',
-    'admin',
+    'read:patients', 'write:patients',
+    'read:appointments', 'write:appointments',
+    'read:records', 'write:records', 'admin',
   ],
   code_challenge_methods_supported:     ['S256', 'plain'],
   require_pkce_for_public_clients:      true,
@@ -144,8 +142,322 @@ const listClients = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
+//  HTML Login Page helper
+//  Renders a styled consent/login form that works inside the
+//  Postman OAuth popup (desktop app) and browser (web app).
+// ─────────────────────────────────────────────────────────────
+const buildLoginPage = ({ clientName, scope, queryString, error: errMsg }) => `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>HealthAPI — Sign In</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0f1117;
+      --surface:  #181c27;
+      --border:   #2a2f3e;
+      --accent:   #4f8ef7;
+      --accent2:  #34d399;
+      --danger:   #f87171;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --radius:   12px;
+    }
+
+    body {
+      font-family: 'DM Sans', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(79,142,247,0.12) 0%, transparent 60%);
+    }
+
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 40px 36px 36px;
+      box-shadow: 0 25px 60px rgba(0,0,0,0.5);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+    }
+
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+
+    .logo-text {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+    }
+
+    .logo-text span { color: var(--accent); }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+      margin-bottom: 6px;
+    }
+
+    .subtitle {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 24px;
+      line-height: 1.5;
+    }
+
+    .scope-box {
+      background: rgba(79,142,247,0.06);
+      border: 1px solid rgba(79,142,247,0.2);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 24px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .scope-box strong {
+      display: block;
+      color: var(--text);
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+
+    .scope-tags {
+      display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px;
+    }
+
+    .scope-tag {
+      background: rgba(79,142,247,0.15);
+      color: var(--accent);
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 5px;
+    }
+
+    .error-banner {
+      background: rgba(248,113,113,0.1);
+      border: 1px solid rgba(248,113,113,0.3);
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-bottom: 18px;
+      font-size: 13px;
+      color: var(--danger);
+      display: flex; align-items: center; gap: 8px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+
+    input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: 'DM Sans', sans-serif;
+      font-size: 14px;
+      padding: 11px 14px;
+      margin-bottom: 16px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input:focus { border-color: var(--accent); }
+    input::placeholder { color: var(--muted); }
+
+    .hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: -12px;
+      margin-bottom: 16px;
+      font-family: 'DM Mono', monospace;
+    }
+
+    button[type="submit"] {
+      width: 100%;
+      background: linear-gradient(135deg, var(--accent), #6fa8f8);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius);
+      font-family: 'DM Sans', sans-serif;
+      font-size: 14px;
+      font-weight: 600;
+      padding: 13px;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+      letter-spacing: 0.2px;
+    }
+
+    button[type="submit"]:hover { opacity: 0.9; transform: translateY(-1px); }
+    button[type="submit"]:active { transform: translateY(0); }
+
+    .divider {
+      text-align: center;
+      font-size: 12px;
+      color: var(--muted);
+      margin: 16px 0;
+      position: relative;
+    }
+
+    .divider::before, .divider::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      width: calc(50% - 30px);
+      height: 1px;
+      background: var(--border);
+    }
+    .divider::before { left: 0; }
+    .divider::after  { right: 0; }
+
+    .creds-grid {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 20px;
+    }
+
+    .cred-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+
+    .cred-row:hover { border-color: var(--accent); }
+
+    .cred-label {
+      font-weight: 500;
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .cred-role {
+      font-family: 'DM Mono', monospace;
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: rgba(52,211,153,0.12);
+      color: var(--accent2);
+    }
+
+    .footer {
+      margin-top: 20px;
+      text-align: center;
+      font-size: 11px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <div class="logo-icon">🏥</div>
+      <div class="logo-text">Health<span>API</span></div>
+    </div>
+
+    <h1>Sign in to authorize</h1>
+    <p class="subtitle">
+      <strong>${clientName || 'An application'}</strong> is requesting access to your HealthAPI account.
+    </p>
+
+    ${scope ? `
+    <div class="scope-box">
+      <strong>Requested permissions</strong>
+      <div class="scope-tags">
+        ${scope.split(' ').map(s => `<span class="scope-tag">${s}</span>`).join('')}
+      </div>
+    </div>` : ''}
+
+    ${errMsg ? `
+    <div class="error-banner">
+      ⚠️ ${errMsg}
+    </div>` : ''}
+
+    <form method="POST" action="/api/oauth/authorize${queryString}">
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email"
+             placeholder="admin@healthapi.com" required autocomplete="username" />
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             placeholder="••••••••" required autocomplete="current-password" />
+      <p class="hint">Default password for all accounts: Admin@1234</p>
+
+      <button type="submit">Authorize Access →</button>
+    </form>
+
+    <div class="divider">test accounts</div>
+
+    <div class="creds-grid">
+      <div class="cred-row" onclick="fillCreds('admin@healthapi.com')">
+        <span class="cred-label">admin@healthapi.com</span>
+        <span class="cred-role">admin</span>
+      </div>
+      <div class="cred-row" onclick="fillCreds('sarah.mehta@healthapi.com')">
+        <span class="cred-label">sarah.mehta@healthapi.com</span>
+        <span class="cred-role">doctor</span>
+      </div>
+      <div class="cred-row" onclick="fillCreds('priya.nair@healthapi.com')">
+        <span class="cred-label">priya.nair@healthapi.com</span>
+        <span class="cred-role">nurse</span>
+      </div>
+    </div>
+
+    <div class="footer">HealthAPI v2.0 · Supabase + Render · Secure OAuth 2.0</div>
+  </div>
+
+  <script>
+    function fillCreds(email) {
+      document.getElementById('email').value = email;
+      document.getElementById('password').value = 'Admin@1234';
+      document.getElementById('password').focus();
+    }
+  </script>
+</body>
+</html>`;
+
+// ─────────────────────────────────────────────────────────────
 //  GET  /api/oauth/authorize
-//  Step 1 of Authorization Code flow
+//  Step 1 — Show login/consent page
+//  (FIX: was blindly redirecting; now serves a real login form)
 // ─────────────────────────────────────────────────────────────
 const authorize = async (req, res) => {
   const {
@@ -156,13 +468,13 @@ const authorize = async (req, res) => {
     state,
     code_challenge,
     code_challenge_method,
+    login_error,   // set internally on bad credentials
   } = req.query;
 
+  // ── Validate params before showing the form ──────────────
   if (response_type !== 'code') {
-    return error(res, 400, 'UNSUPPORTED_RESPONSE_TYPE',
-      'response_type must be "code".');
+    return error(res, 400, 'UNSUPPORTED_RESPONSE_TYPE', 'response_type must be "code".');
   }
-
   if (!client_id) {
     return error(res, 400, 'MISSING_CLIENT_ID', 'client_id is required.');
   }
@@ -186,6 +498,7 @@ const authorize = async (req, res) => {
       `redirect_uri '${redirect_uri}' is not registered for this client. Registered: ${client.redirect_uris.join(', ')}`);
   }
 
+  // ── Validate scopes ───────────────────────────────────────
   const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
   const invalidScopes   = requestedScopes.filter(s => !client.scopes.includes(s));
   if (invalidScopes.length > 0) {
@@ -193,24 +506,102 @@ const authorize = async (req, res) => {
       `Scopes not permitted: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
   }
 
+  // ── Preserve the full query string so the POST form targets the right URL ──
+  const qs = '?' + new URLSearchParams({
+    response_type,
+    client_id,
+    redirect_uri,
+    scope: requestedScopes.join(' '),
+    ...(state               ? { state }               : {}),
+    ...(code_challenge      ? { code_challenge }      : {}),
+    ...(code_challenge_method ? { code_challenge_method } : {}),
+  }).toString();
+
+  // ── Serve the HTML login page ─────────────────────────────
+  return res.status(200).send(buildLoginPage({
+    clientName: client.name,
+    scope: requestedScopes.join(' '),
+    queryString: qs,
+    error: login_error || null,
+  }));
+};
+
+// ─────────────────────────────────────────────────────────────
+//  POST  /api/oauth/authorize
+//  Step 2 — Process login form, issue code, redirect
+//  (NEW: handles the form submission from the login page above)
+// ─────────────────────────────────────────────────────────────
+const authorizePost = async (req, res) => {
+  const {
+    response_type,
+    client_id,
+    redirect_uri,
+    scope,
+    state,
+    code_challenge,
+    code_challenge_method,
+  } = req.query;
+
+  const { email, password } = req.body;
+  const ip = getClientIp(req);
+
+  // ── Re-validate client (always re-check on POST) ─────────
+  const { data: client } = await supabase
+    .from('oauth_clients')
+    .select('*')
+    .eq('client_id', client_id)
+    .single();
+
+  if (!client || !client.redirect_uris.includes(redirect_uri)) {
+    return error(res, 400, 'INVALID_CLIENT', 'Invalid client or redirect_uri.');
+  }
+
+  const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
+
+  // ── Authenticate the user ─────────────────────────────────
+  const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
+  const { data: user } = await supabase
+    .from('users')
+    .select('*')
+    .eq('email', (email || '').toLowerCase().trim())
+    .single();
+
+  const hashToCheck = user ? user.password : dummyHash;
+  let valid = await bcrypt.compare(password || '', hashToCheck);
+  // Dev convenience: accept plaintext password
+  if (!valid && process.env.NODE_ENV !== 'production' && password === 'Admin@1234') {
+    valid = true;
+  }
+
+  if (!user || !valid) {
+    // Bad credentials — re-render login page with error, preserving all params
+    const qs = '?' + new URLSearchParams({
+      response_type, client_id, redirect_uri,
+      scope: requestedScopes.join(' '),
+      ...(state               ? { state }               : {}),
+      ...(code_challenge      ? { code_challenge }      : {}),
+      ...(code_challenge_method ? { code_challenge_method } : {}),
+      login_error: 'Invalid email or password. Please try again.',
+    }).toString();
+
+    return res.redirect(302, `/api/oauth/authorize${qs}`);
+  }
+
+  // ── Issue auth code ───────────────────────────────────────
   if (code_challenge) {
     const method = code_challenge_method || 'plain';
     if (!['S256', 'plain'].includes(method)) {
       return error(res, 400, 'INVALID_CODE_CHALLENGE_METHOD',
         'code_challenge_method must be S256 or plain.');
     }
-    if (method === 'plain') {
-      console.warn('[OAUTH] Client using PKCE plain method — S256 strongly preferred.');
-    }
   }
 
-  // ── Issue auth code ───────────────────────────────────────
   const code      = generateSecureToken('hapi_code', 24);
   const expiresAt = new Date(Date.now() + OAUTH_AUTH_CODE_TTL * 1000).toISOString();
 
   await supabase.from('oauth_auth_codes').insert({
     code,
-    user_id:               'usr_001',
+    user_id:               user.id,
     client_id,
     scope:                 requestedScopes.join(' '),
     redirect_uri,
@@ -220,14 +611,13 @@ const authorize = async (req, res) => {
     used:                  false,
   });
 
-  const ip = getClientIp(req);
   audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-    ip, clientId: client_id,
+    ip, clientId: client_id, userId: user.id,
     event: 'auth_code_issued',
     scope: requestedScopes.join(' '),
   });
 
-  // ── Real 302 redirect — Postman OAuth popup intercepts this ──
+  // ── Redirect back to the client (Postman intercepts this) ──
   const callbackUrl = new URL(redirect_uri);
   callbackUrl.searchParams.set('code', code);
   if (state) callbackUrl.searchParams.set('state', state);
@@ -236,32 +626,26 @@ const authorize = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  POST  /api/oauth/token
-//  All 4 grant types
+//  POST  /api/oauth/token  — All 4 grant types (unchanged)
 // ─────────────────────────────────────────────────────────────
 const token = async (req, res) => {
   const { grant_type } = req.body;
   const ip = getClientIp(req);
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  GRANT: authorization_code
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── GRANT: authorization_code ─────────────────────────────
   if (grant_type === 'authorization_code') {
     const { code, redirect_uri, client_id, client_secret, code_verifier } = req.body;
 
     const missing = ['code', 'redirect_uri', 'client_id', 'client_secret'].filter(f => !req.body[f]);
-    if (missing.length) {
+    if (missing.length)
       return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
-    }
 
     const client = await validateClient(client_id, client_secret);
-    if (!client) {
+    if (!client)
       return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
-    }
-    if (!client.grant_types.includes('authorization_code')) {
+    if (!client.grant_types.includes('authorization_code'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
         `Client '${client_id}' is not authorized to use the authorization_code grant type.`);
-    }
 
     const { data: codeRecord, error: codeErr } = await supabase
       .from('oauth_auth_codes')
@@ -269,18 +653,15 @@ const token = async (req, res) => {
       .eq('code', code)
       .single();
 
-    if (codeErr || !codeRecord) {
+    if (codeErr || !codeRecord)
       return error(res, 400, 'INVALID_GRANT', 'Authorization code not found or already used.');
-    }
 
     if (codeRecord.used) {
       await Promise.all([
         supabase.from('oauth_auth_codes').delete().eq('code', code),
         supabase.from('oauth_access_tokens').delete().eq('client_id', client_id),
       ]);
-      audit(AUDIT_EVENTS.BRUTE_FORCE, {
-        ip, clientId: client_id, reason: 'Authorization code reuse detected',
-      });
+      audit(AUDIT_EVENTS.BRUTE_FORCE, { ip, clientId: client_id, reason: 'Authorization code reuse' });
       return error(res, 400, 'CODE_REUSE_DETECTED',
         'Authorization code already used. All tokens for this client have been revoked.');
     }
@@ -291,59 +672,47 @@ const token = async (req, res) => {
         `Authorization code expired (TTL: ${OAUTH_AUTH_CODE_TTL}s). Restart the authorization flow.`);
     }
 
-    if (codeRecord.redirect_uri !== redirect_uri) {
+    if (codeRecord.redirect_uri !== redirect_uri)
       return error(res, 400, 'REDIRECT_URI_MISMATCH',
         'redirect_uri does not match the one used during authorization.');
-    }
 
-    if (codeRecord.client_id !== client_id) {
+    if (codeRecord.client_id !== client_id)
       return error(res, 400, 'CLIENT_MISMATCH',
         'This authorization code was issued to a different client.');
-    }
 
     if (codeRecord.code_challenge) {
-      if (!code_verifier) {
+      if (!code_verifier)
         return error(res, 400, 'PKCE_REQUIRED',
           'code_verifier is required — this code was issued with a code_challenge.');
-      }
-      if (!verifyCodeChallenge(code_verifier, codeRecord.code_challenge, codeRecord.code_challenge_method || 'plain')) {
+      if (!verifyCodeChallenge(code_verifier, codeRecord.code_challenge, codeRecord.code_challenge_method || 'plain'))
         return error(res, 400, 'PKCE_MISMATCH',
           'code_verifier does not match the stored code_challenge.');
-      }
     }
 
     await supabase.from('oauth_auth_codes').update({ used: true }).eq('code', code);
 
     const tokenData = await buildTokenResponse(codeRecord.user_id, client_id, codeRecord.scope);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'authorization_code', userId: codeRecord.user_id });
-
     return success(res, tokenData, 'Token issued via authorization_code.');
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  GRANT: client_credentials
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── GRANT: client_credentials ─────────────────────────────
   if (grant_type === 'client_credentials') {
     const { client_id, client_secret, scope } = req.body;
-
-    if (!client_id || !client_secret) {
+    if (!client_id || !client_secret)
       return error(res, 400, 'MISSING_PARAMS', 'client_id and client_secret are required.');
-    }
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
-
-    if (!client.grant_types.includes('client_credentials')) {
+    if (!client.grant_types.includes('client_credentials'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
         `Client '${client_id}' is not authorized to use the client_credentials grant type.`);
-    }
 
     const requestedScope = (scope || 'read:patients').split(' ').filter(Boolean);
     const invalidScopes  = requestedScope.filter(s => !client.scopes.includes(s));
-    if (invalidScopes.length) {
+    if (invalidScopes.length)
       return error(res, 400, 'INVALID_SCOPE',
         `Scope(s) not permitted: ${invalidScopes.join(', ')}. Allowed: ${client.scopes.join(', ')}`);
-    }
 
     const accessToken = generateSecureToken('hapi_cc');
     const expiresAt   = new Date(Date.now() + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
@@ -357,7 +726,6 @@ const token = async (req, res) => {
     });
 
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'client_credentials' });
-
     return res.status(200).json({
       success: true,
       message: 'Token issued via client_credentials.',
@@ -371,24 +739,18 @@ const token = async (req, res) => {
     });
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  GRANT: password
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── GRANT: password ───────────────────────────────────────
   if (grant_type === 'password') {
     const { username, password, client_id, client_secret, scope } = req.body;
-
     const missing = ['username', 'password', 'client_id', 'client_secret'].filter(f => !req.body[f]);
-    if (missing.length) {
+    if (missing.length)
       return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
-    }
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
-
-    if (!client.grant_types.includes('password')) {
+    if (!client.grant_types.includes('password'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
         `Client '${client_id}' is not authorized to use the password grant type.`);
-    }
 
     const lockResult = isLocked(ip, username?.toLowerCase());
     if (lockResult.locked) {
@@ -399,10 +761,7 @@ const token = async (req, res) => {
 
     const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
     const { data: user } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', username.toLowerCase().trim())
-      .single();
+      .from('users').select('*').eq('email', username.toLowerCase().trim()).single();
 
     const hashToCheck = user ? user.password : dummyHash;
     let valid = await bcrypt.compare(password, hashToCheck);
@@ -416,52 +775,37 @@ const token = async (req, res) => {
     const grantedScope = scope || 'read:patients read:appointments';
     const tokenData = await buildTokenResponse(user.id, client_id, grantedScope);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'password', userId: user.id });
-
     return success(res, tokenData, 'Token issued via password grant.');
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  GRANT: refresh_token
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ── GRANT: refresh_token ──────────────────────────────────
   if (grant_type === 'refresh_token') {
     const { refresh_token, client_id, client_secret } = req.body;
-
     const missing = ['refresh_token', 'client_id', 'client_secret'].filter(f => !req.body[f]);
-    if (missing.length) {
+    if (missing.length)
       return error(res, 400, 'MISSING_PARAMS', `Required fields missing: ${missing.join(', ')}`);
-    }
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
-
-    if (!client.grant_types.includes('refresh_token')) {
+    if (!client.grant_types.includes('refresh_token'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE',
         `Client '${client_id}' is not authorized to use the refresh_token grant type.`);
-    }
 
     const { data: rtRecord } = await supabase
-      .from('oauth_refresh_tokens')
-      .select('*')
-      .eq('token', refresh_token)
-      .single();
+      .from('oauth_refresh_tokens').select('*').eq('token', refresh_token).single();
 
-    if (!rtRecord) {
+    if (!rtRecord)
       return error(res, 400, 'INVALID_GRANT',
         'Refresh token not found or already revoked. Please re-authenticate.');
-    }
 
-    if (rtRecord.client_id !== client_id) {
+    if (rtRecord.client_id !== client_id)
       return error(res, 400, 'CLIENT_MISMATCH',
         'This refresh token was issued to a different client.');
-    }
 
     await supabase.from('oauth_refresh_tokens').delete().eq('token', refresh_token);
 
     const tokenData = await buildTokenResponse(rtRecord.user_id, client_id, rtRecord.scope);
-    audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-      ip, clientId: client_id, grant: 'refresh_token', userId: rtRecord.user_id,
-    });
-
+    audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'refresh_token', userId: rtRecord.user_id });
     return success(res, {
       ...tokenData,
       note: 'Previous refresh_token has been rotated and is now invalid.',
@@ -491,15 +835,11 @@ const revoke = async (req, res) => {
   let revoked = false;
   for (const table of tables) {
     const { data, error: dbErr } = await supabase
-      .from(table)
-      .delete()
-      .eq('token', tok)
-      .select('token');
+      .from(table).delete().eq('token', tok).select('token');
     if (!dbErr && data && data.length > 0) { revoked = true; break; }
   }
 
   audit(AUDIT_EVENTS.OAUTH_REVOKE, { ip, clientId: client_id, revoked });
-
   return res.status(200).json({
     success: true,
     message: revoked ? 'Token revoked successfully.' : 'Token not found (may have already expired or been revoked).',
@@ -512,7 +852,6 @@ const revoke = async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 const introspect = async (req, res) => {
   const { token: tok, client_id, client_secret } = req.body;
-
   if (!tok) return error(res, 400, 'MISSING_PARAMS', 'token is required.');
 
   const client = await validateClient(client_id, client_secret);
@@ -525,9 +864,7 @@ const introspect = async (req, res) => {
     .single();
 
   if (!record || new Date() > new Date(record.expires_at)) {
-    if (record) {
-      await supabase.from('oauth_access_tokens').delete().eq('token', tok);
-    }
+    if (record) await supabase.from('oauth_access_tokens').delete().eq('token', tok);
     return res.status(200).json({ active: false });
   }
 
@@ -563,6 +900,7 @@ module.exports = {
   listClients,
   serverMetadata,
   authorize,
+  authorizePost,   // ← NEW export
   token,
   revoke,
   introspect,
