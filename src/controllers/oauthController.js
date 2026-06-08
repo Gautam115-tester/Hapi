@@ -9,7 +9,10 @@
 //    3. Works in Postman web app too (shows code to paste manually)
 //
 //  USE THIS as your redirect_uri in Postman:
-//    https://healthapi.onrender.com/api/oauth/callback
+//    https://hapi-2115.onrender.com/api/oauth/callback
+//
+//  FIX: authorizePost now checks both `users` AND `api_tester_accounts`
+//       so registered testers can log in with their own credentials.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -28,7 +31,7 @@ const {
   isLocked, recordFailure,
 } = require('../utils/authSecurity');
 
-const ISSUER = BASE_URL || 'https://healthapi.onrender.com';
+const ISSUER = BASE_URL || 'https://hapi-2115.onrender.com';
 
 // ── Client credential validation ─────────────────────────────
 const validateClient = async (clientId, clientSecret) => {
@@ -83,6 +86,40 @@ const buildTokenResponse = async (userId, clientId, scope) => {
       sub: userId || 'service-account',
       username: user?.email || null, role: user?.role || 'service',
     },
+  };
+};
+
+// ── Unified user lookup (users table + api_tester_accounts) ──
+// Returns a normalised user object or null.
+const lookupUser = async (email) => {
+  const normalised = (email || '').toLowerCase().trim();
+
+  // 1. Check main users table first
+  const { data: user } = await supabase
+    .from('users')
+    .select('*')
+    .eq('email', normalised)
+    .single();
+
+  if (user) return user;
+
+  // 2. Fall back to api_tester_accounts (registered testers)
+  const { data: tester } = await supabase
+    .from('api_tester_accounts')
+    .select('*')
+    .eq('email', normalised)
+    .single();
+
+  if (!tester) return null;
+
+  // Map tester shape → user shape so the rest of the code works unchanged
+  return {
+    id:         tester.id,
+    name:       tester.full_name,
+    email:      tester.email,
+    password:   tester.password,
+    role:       tester.role,
+    department: tester.organisation || null,
   };
 };
 
@@ -188,27 +225,27 @@ const buildLoginPage = ({ clientName, scope, queryString, loginError }) => `<!DO
       <input id="email" name="email" type="email" placeholder="admin@healthapi.com" required autocomplete="username"/>
       <label for="password">Password</label>
       <input id="password" name="password" type="password" placeholder="••••••••" required autocomplete="current-password"/>
-      <p class="hint">Default password for all accounts: Admin@1234</p>
+      <p class="hint">Use your registered email and password</p>
       <button type="submit">Authorize Access →</button>
     </form>
     <div class="divider">test accounts</div>
     <div class="creds-grid">
-      <div class="cred-row" onclick="fillCreds('admin@healthapi.com')">
+      <div class="cred-row" onclick="fillCreds('admin@healthapi.com','Admin@1234')">
         <span class="cred-label">admin@healthapi.com</span><span class="cred-role">admin</span>
       </div>
-      <div class="cred-row" onclick="fillCreds('sarah.mehta@healthapi.com')">
+      <div class="cred-row" onclick="fillCreds('sarah.mehta@healthapi.com','Admin@1234')">
         <span class="cred-label">sarah.mehta@healthapi.com</span><span class="cred-role">doctor</span>
       </div>
-      <div class="cred-row" onclick="fillCreds('priya.nair@healthapi.com')">
+      <div class="cred-row" onclick="fillCreds('priya.nair@healthapi.com','Admin@1234')">
         <span class="cred-label">priya.nair@healthapi.com</span><span class="cred-role">nurse</span>
       </div>
     </div>
     <div class="footer">HealthAPI v2.0 · OAuth 2.0 Authorization Server</div>
   </div>
   <script>
-    function fillCreds(email){
-      document.getElementById('email').value=email;
-      document.getElementById('password').value='Admin@1234';
+    function fillCreds(email, pass){
+      document.getElementById('email').value = email;
+      document.getElementById('password').value = pass;
     }
   </script>
 </body>
@@ -258,6 +295,7 @@ const authorize = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/authorize  — Process login, issue code, redirect
+//  FIX: now checks both users table AND api_tester_accounts
 // ─────────────────────────────────────────────────────────────
 const authorizePost = async (req, res) => {
   const { response_type, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method } = req.query;
@@ -269,13 +307,11 @@ const authorizePost = async (req, res) => {
 
   const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
 
-  // Authenticate user
+  // ── Unified user lookup: users table first, then api_tester_accounts ──
   const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
-  const { data: user } = await supabase
-    .from('users').select('*').eq('email', (email || '').toLowerCase().trim()).single();
+  const user = await lookupUser(email);
   const hashToCheck = user ? user.password : dummyHash;
   let valid = await bcrypt.compare(password || '', hashToCheck);
-  if (!valid && process.env.NODE_ENV !== 'production' && password === 'Admin@1234') valid = true;
 
   if (!user || !valid) {
     // Re-render login page with error
@@ -318,11 +354,6 @@ const authorizePost = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  GET /api/oauth/callback  — Self-hosted callback page
-//
-//  This is the redirect_uri your Postman should use.
-//  It works for BOTH desktop app and web app:
-//    - Desktop: shows code and auto-triggers the deep link
-//    - Web app: shows code to copy-paste
 // ─────────────────────────────────────────────────────────────
 const callbackPage = (req, res) => {
   const { code, state, error: oauthError, error_description } = req.query;
@@ -334,9 +365,6 @@ const callbackPage = (req, res) => {
 </head><body><div><h2>❌ Authorization Failed</h2><p>${oauthError}: ${error_description || ''}</p></div></body></html>`);
   }
 
-  // This page handles the Postman desktop app interception.
-  // The desktop app watches for navigation to this URL and extracts the code.
-  // For the web app, we show the code clearly so it can be copied.
   return res.status(200).send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -404,9 +432,6 @@ const callbackPage = (req, res) => {
         setTimeout(()=>btn.textContent='Copy', 1500);
       });
     }
-    // For Postman desktop: it monitors navigation and extracts the code from the URL.
-    // No extra JS needed — just having the code in the URL query string is enough.
-    // This page just provides a nice fallback UI.
   </script>
 </body>
 </html>`);
@@ -502,11 +527,12 @@ const token = async (req, res) => {
     if (!client.grant_types.includes('password'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for password grant.');
 
+    // ── Also check api_tester_accounts for password grant ──
     const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
-    const { data: user } = await supabase.from('users').select('*').eq('email', username.toLowerCase().trim()).single();
+    const user = await lookupUser(username);
     const hashToCheck = user ? user.password : dummyHash;
     let valid = await bcrypt.compare(password, hashToCheck);
-    if (!valid && process.env.NODE_ENV !== 'production' && password === 'Admin@1234') valid = true;
+
     if (!user || !valid)
       return error(res, 401, 'INVALID_CREDENTIALS', 'Invalid username or password.');
 
