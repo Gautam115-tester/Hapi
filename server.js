@@ -14,9 +14,10 @@ const authRoutes        = require('./src/routes/auth');
 const oauthRoutes       = require('./src/routes/oauth');
 const patientRoutes     = require('./src/routes/patients');
 const appointmentRoutes = require('./src/routes/appointments');
-const publicRoutes      = require('./src/routes/public');          // ← NEW: no-auth routes
+const publicRoutes      = require('./src/routes/public');    
+const registerRoutes    = require('./src/routes/register');      // ← NEW: no-auth routes
 const { doctorRouter, recordRouter, wardRouter, simulateRouter, validateRouter, dashRouter } = require('./src/routes/misc');
-const registerRoutes = require('./src/routes/register');
+
 
 const app = express();
 
@@ -232,6 +233,7 @@ app.use('/api/auth',         authRoutes);
 app.use('/api/oauth',        oauthRoutes);
 app.use('/api/patients',     patientRoutes);
 app.use('/api/appointments', appointmentRoutes);
+app.use('/api/register',     registerRoutes);
 app.use('/api/doctors',      doctorRouter);
 app.use('/api/records',      recordRouter);
 app.use('/api/wards',        wardRouter);
@@ -262,6 +264,6 @@ app.listen(PORT, () => {
   console.log(`🗄️   Database    → Supabase (${process.env.SUPABASE_URL || 'NOT SET'})\n`);
 });
 
-app.use('/api/register', registerRoutes);
+
 
 module.exports = app;
