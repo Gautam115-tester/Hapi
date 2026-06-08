@@ -16,6 +16,7 @@ const patientRoutes     = require('./src/routes/patients');
 const appointmentRoutes = require('./src/routes/appointments');
 const publicRoutes      = require('./src/routes/public');          // ← NEW: no-auth routes
 const { doctorRouter, recordRouter, wardRouter, simulateRouter, validateRouter, dashRouter } = require('./src/routes/misc');
+const registerRoutes = require('./src/routes/register');
 
 const app = express();
 
@@ -260,5 +261,7 @@ app.listen(PORT, () => {
   console.log(`❤️   Health      → http://localhost:${PORT}/api/health`);
   console.log(`🗄️   Database    → Supabase (${process.env.SUPABASE_URL || 'NOT SET'})\n`);
 });
+
+app.use('/api/register', registerRoutes);
 
 module.exports = app;
