@@ -493,31 +493,42 @@ const token = async (req, res) => {
     if (!client.grant_types.includes('authorization_code'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for authorization_code.');
 
+    // ── Step 1: Fetch the code record ────────────────────────
     const { data: codeRecord, error: codeErr } = await supabase
       .from('oauth_auth_codes').select('*').eq('code', code).single();
+
+    // Code not found at all — either never existed or already fully consumed
     if (codeErr || !codeRecord)
       return error(res, 400, 'INVALID_GRANT', 'Authorization code not found or already used.');
+
+    // Code was previously marked used — this is a replay attack
     if (codeRecord.used) {
       await Promise.all([
         supabase.from('oauth_auth_codes').delete().eq('code', code),
         supabase.from('oauth_access_tokens').delete().eq('client_id', client_id),
       ]);
-      return error(res, 400, 'CODE_REUSE_DETECTED', 'Authorization code already used. All tokens revoked.');
+      return error(res, 400, 'CODE_REUSE_DETECTED', 'Authorization code already used. All tokens revoked for security.');
     }
+
+    // ── Step 2: Validate everything BEFORE consuming the code ─
+    // This prevents the code from being burned on a bad request
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
-      return error(res, 400, 'CODE_EXPIRED', 'Authorization code expired. Restart the flow.');
+      return error(res, 400, 'CODE_EXPIRED', 'Authorization code expired. Please restart the authorization flow.');
     }
     if (codeRecord.redirect_uri !== redirect_uri)
-      return error(res, 400, 'REDIRECT_URI_MISMATCH', 'redirect_uri does not match.');
+      return error(res, 400, 'REDIRECT_URI_MISMATCH',
+        `redirect_uri mismatch. Expected: ${codeRecord.redirect_uri}`);
     if (codeRecord.client_id !== client_id)
       return error(res, 400, 'CLIENT_MISMATCH', 'Authorization code was issued to a different client.');
     if (codeRecord.code_challenge) {
-      if (!code_verifier) return error(res, 400, 'PKCE_REQUIRED', 'code_verifier required.');
+      if (!code_verifier) return error(res, 400, 'PKCE_REQUIRED', 'code_verifier is required for PKCE.');
       if (!verifyCodeChallenge(code_verifier, codeRecord.code_challenge, codeRecord.code_challenge_method || 'plain'))
         return error(res, 400, 'PKCE_MISMATCH', 'code_verifier does not match code_challenge.');
     }
 
+    // ── Step 3: Atomically consume code and issue tokens ─────
+    // Mark as used first — if token insert fails, code is still burned (safe)
     await supabase.from('oauth_auth_codes').update({ used: true }).eq('code', code);
     const tokenData = await buildTokenResponse(codeRecord.user_id, client_id, codeRecord.scope);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'authorization_code', userId: codeRecord.user_id });
