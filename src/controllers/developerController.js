@@ -1,14 +1,14 @@
 // src/controllers/developerController.js
 // ============================================================
-//  HealthAPI — API Tester Registration Portal
+//  HealthAPI — Integration Access Portal
 //
-//  Allows testers (lab participants, evaluators, integration
-//  partners) to self-register and receive unique OAuth2
-//  credentials to access the HealthAPI.
+//  Healthcare professionals and IT teams register here to
+//  obtain OAuth 2.0 credentials for system integration,
+//  clinical data access, and API connectivity testing.
 //
-//  POST /api/register        — create tester account
-//  POST /api/register/login  — login, retrieve credentials
-//  GET  /api/register/me     — view my credentials (auth needed)
+//  POST /api/register            — register and receive credentials
+//  POST /api/register/login      — authenticate and retrieve credentials
+//  GET  /api/register/me         — view active credentials
 //  POST /api/register/regenerate — rotate client secret
 // ============================================================
 
@@ -19,7 +19,8 @@ const supabase = require('../utils/db');
 const { JWT_SECRET, JWT_EXPIRES_IN, BASE_URL } = require('../utils/config');
 const { success, error } = require('../utils/response');
 
-const ISSUER = BASE_URL || 'https://hapi-2115.onrender.com';
+const ISSUER  = BASE_URL || 'https://hapi-2115.onrender.com';
+const API_VER = 'v2.0';
 
 // ── Helpers ───────────────────────────────────────────────────
 const generateClientId = (fullName) => {
@@ -29,11 +30,11 @@ const generateClientId = (fullName) => {
     .replace(/_+/g, '_')
     .slice(0, 18);
   const rand = crypto.randomBytes(4).toString('hex');
-  return `tester_${slug}_${rand}`;
+  return `hapi_${slug}_${rand}`;
 };
 
 const generateClientSecret = () =>
-  'hapi_' + crypto.randomBytes(22).toString('hex');
+  'hapi_sk_' + crypto.randomBytes(22).toString('hex');
 
 const signToken = (account) =>
   jwt.sign(
@@ -42,47 +43,61 @@ const signToken = (account) =>
     { issuer: ISSUER, expiresIn: JWT_EXPIRES_IN, algorithm: 'HS256' }
   );
 
-const buildCredentialBlock = (clientId, clientSecret) => ({
+const roleLabels = {
+  doctor:           'Medical Doctor',
+  nurse:            'Registered Nurse',
+  lab_technician:   'Laboratory Technician',
+  researcher:       'Clinical Researcher',
+  it_administrator: 'IT Administrator',
+  auditor:          'Compliance Auditor',
+};
+
+const buildAccessBlock = (clientId, clientSecret) => ({
   client_id:     clientId,
   client_secret: clientSecret,
-  auth_url:      `${ISSUER}/api/oauth/authorize`,
-  token_url:     `${ISSUER}/api/oauth/token`,
-  scopes_available: [
+  authorization_endpoint: `${ISSUER}/api/oauth/authorize`,
+  token_endpoint:         `${ISSUER}/api/oauth/token`,
+  token_endpoint_auth_method: 'client_secret_basic',
+  grant_types_supported:  ['client_credentials', 'authorization_code', 'refresh_token', 'password'],
+  scopes_granted: [
     'read:patients',
     'write:patients',
     'read:appointments',
     'write:appointments',
     'read:records',
   ],
+  access_token_ttl:  '3600 seconds (1 hour)',
+  refresh_token_ttl: '604800 seconds (7 days)',
 });
 
-const buildPostmanBlock = (clientId, clientSecret) => ({
-  note:             'Fill these 4 fields in Postman → Authorization → OAuth 2.0 → Configure New Token',
-  grant_type:       'Client Credentials',
-  access_token_url: `${ISSUER}/api/oauth/token`,
-  client_id:         clientId,
-  client_secret:     clientSecret,
-  scope:            'read:patients write:patients',
-  client_authentication: 'Send as Basic Auth header',
+const buildIntegrationGuide = (clientId, clientSecret) => ({
+  postman: {
+    authorization_type: 'OAuth 2.0',
+    grant_type:         'Client Credentials',
+    access_token_url:   `${ISSUER}/api/oauth/token`,
+    client_id:           clientId,
+    client_secret:       clientSecret,
+    scope:              'read:patients write:patients read:appointments',
+    client_authentication: 'Send as Basic Auth header',
+  },
+  curl_example: `curl -X POST ${ISSUER}/api/oauth/token \\\n  -H "Content-Type: application/x-www-form-urlencoded" \\\n  -d "grant_type=client_credentials&client_id=${clientId}&client_secret=${clientSecret}&scope=read:patients"`,
 });
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/register
-//  Anyone testing the HealthAPI registers here.
-//  Fields: fullName, email, password, organisation, role
 // ─────────────────────────────────────────────────────────────
 const register = async (req, res) => {
   const { fullName, email, password, organisation, role } = req.body;
 
-  // ── Field validation ──────────────────────────────────────
+  // Validation
   const missing = ['fullName', 'email', 'password', 'organisation', 'role']
     .filter(f => !req.body[f]);
   if (missing.length)
     return error(res, 422, 'VALIDATION_ERROR',
-      `Missing required fields: ${missing.join(', ')}`);
+      `Required fields missing: ${missing.join(', ')}.`);
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
-    return error(res, 422, 'VALIDATION_ERROR', 'A valid email address is required.');
+    return error(res, 422, 'VALIDATION_ERROR', 'A valid institutional email address is required.');
 
   if (password.length < 6)
     return error(res, 422, 'VALIDATION_ERROR', 'Password must be at least 6 characters.');
@@ -90,9 +105,9 @@ const register = async (req, res) => {
   const allowedRoles = ['doctor', 'nurse', 'lab_technician', 'researcher', 'it_administrator', 'auditor'];
   if (!allowedRoles.includes(role))
     return error(res, 422, 'VALIDATION_ERROR',
-      `role must be one of: ${allowedRoles.join(', ')}`);
+      `Invalid role. Accepted values: ${allowedRoles.join(', ')}.`);
 
-  // ── Duplicate check ───────────────────────────────────────
+  // Duplicate check
   const { data: existing } = await supabase
     .from('api_tester_accounts')
     .select('id')
@@ -100,15 +115,16 @@ const register = async (req, res) => {
     .single();
 
   if (existing)
-    return error(res, 409, 'EMAIL_CONFLICT',
-      `An account with email '${email}' already exists. Use POST /api/register/login to retrieve your credentials.`);
+    return error(res, 409, 'ACCOUNT_EXISTS',
+      `An access account is already registered under ${email}. Please authenticate via POST /api/register/login.`);
 
-  // ── Generate credentials ──────────────────────────────────
+  // Generate credentials
   const hashedPassword = await bcrypt.hash(password, 10);
   const clientId       = generateClientId(fullName);
   const clientSecret   = generateClientSecret();
+  const issuedAt       = new Date().toISOString();
 
-  // ── Save tester account ───────────────────────────────────
+  // Persist account
   const { data: account, error: dbErr } = await supabase
     .from('api_tester_accounts')
     .insert({
@@ -125,37 +141,61 @@ const register = async (req, res) => {
 
   if (dbErr) return error(res, 500, 'DB_ERROR', dbErr.message);
 
-  // ── Register as live OAuth client ────────────────────────
+  // Register as live OAuth client
   await supabase.from('oauth_clients').insert({
     client_id:     clientId,
     client_secret: clientSecret,
-    name:          `${fullName.trim()} — ${organisation.trim()}`,
+    name:          `${fullName.trim()} · ${organisation.trim()}`,
     redirect_uris: ['https://oauth.pstmn.io/v1/callback', 'http://localhost:3000/callback'],
     grant_types:   ['authorization_code', 'client_credentials', 'refresh_token', 'password'],
     scopes:        ['read:patients', 'write:patients', 'read:appointments',
                     'write:appointments', 'read:records', 'admin'],
   });
 
-  const token = signToken({ id: account.id, email: account.email, name: account.full_name });
+  const sessionToken = signToken({
+    id: account.id, email: account.email, name: account.full_name,
+  });
 
   return success(res, {
-    session_token: token,
-    account: {
-      full_name:    account.full_name,
-      email:        account.email,
-      organisation: account.organisation,
-      role:         account.role,
-      registered_at: account.created_at,
+    api:     'HealthAPI',
+    version:  API_VER,
+    status:  'ACCESS_GRANTED',
+
+    practitioner: {
+      name:          account.full_name,
+      email:         account.email,
+      role:          roleLabels[account.role] || account.role,
+      organisation:  account.organisation,
+      access_issued: account.created_at,
+      account_id:    account.id,
     },
-    oauth2_credentials: buildCredentialBlock(clientId, clientSecret),
-    postman_setup:      buildPostmanBlock(clientId, clientSecret),
-    next_steps: [
-      'Copy your client_id and client_secret — client_secret will not be shown again.',
-      'In Postman: Authorization tab → OAuth 2.0 → Configure New Token → fill the 4 fields above.',
-      'Click Get New Access Token → Use Token → you can now call any HealthAPI endpoint.',
-      'Use GET /api/register/me with your session_token to view credentials again anytime.',
+
+    access_credentials: buildAccessBlock(clientId, clientSecret),
+
+    integration_guide: buildIntegrationGuide(clientId, clientSecret),
+
+    session: {
+      token:      sessionToken,
+      token_type: 'Bearer',
+      expires_in: JWT_EXPIRES_IN,
+      usage:      'Use this token in Authorization: Bearer <token> to access GET /api/register/me',
+    },
+
+    important_notice: [
+      'Store your client_secret securely — treat it like a password.',
+      'Do not share or commit your client_secret to version control.',
+      'If your client_secret is compromised, rotate it immediately via POST /api/register/regenerate.',
+      'Access tokens expire after 1 hour. Use the refresh_token grant to obtain new ones.',
+      'All API access is logged and auditable per hospital data governance policy.',
     ],
-  }, 'Account registered. Your OAuth2 credentials are ready.', 201);
+
+    endpoints: {
+      retrieve_credentials: `GET  ${ISSUER}/api/register/me`,
+      rotate_secret:        `POST ${ISSUER}/api/register/regenerate`,
+      token_endpoint:       `POST ${ISSUER}/api/oauth/token`,
+      api_documentation:    `GET  ${ISSUER}/api/docs`,
+    },
+  }, 'Access credentials issued. Integration access is now active for your account.', 201);
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -177,25 +217,40 @@ const login = async (req, res) => {
   const valid = await bcrypt.compare(password, account ? account.password : dummy);
 
   if (!account || !valid)
-    return error(res, 401, 'INVALID_CREDENTIALS', 'Invalid email or password.');
+    return error(res, 401, 'INVALID_CREDENTIALS',
+      'Authentication failed. Verify your email and password and try again.');
 
-  const token = signToken({ id: account.id, email: account.email, name: account.full_name });
+  const sessionToken = signToken({
+    id: account.id, email: account.email, name: account.full_name,
+  });
 
   return success(res, {
-    session_token: token,
-    account: {
-      full_name:    account.full_name,
+    api:    'HealthAPI',
+    version: API_VER,
+    status: 'AUTHENTICATED',
+
+    practitioner: {
+      name:         account.full_name,
       email:        account.email,
+      role:         roleLabels[account.role] || account.role,
       organisation: account.organisation,
-      role:         account.role,
+      account_id:   account.id,
     },
-    oauth2_credentials: buildCredentialBlock(account.client_id, account.client_secret),
-    postman_setup:      buildPostmanBlock(account.client_id, account.client_secret),
-  }, 'Login successful. Your credentials are below.');
+
+    access_credentials: buildAccessBlock(account.client_id, account.client_secret),
+
+    integration_guide: buildIntegrationGuide(account.client_id, account.client_secret),
+
+    session: {
+      token:      sessionToken,
+      token_type: 'Bearer',
+      expires_in: JWT_EXPIRES_IN,
+    },
+  }, 'Authentication successful. Your integration credentials are listed below.');
 };
 
 // ─────────────────────────────────────────────────────────────
-//  GET /api/register/me   (session token required)
+//  GET /api/register/me
 // ─────────────────────────────────────────────────────────────
 const me = async (req, res) => {
   const { data: account } = await supabase
@@ -205,34 +260,44 @@ const me = async (req, res) => {
     .single();
 
   if (!account)
-    return error(res, 404, 'NOT_FOUND', 'Account not found.');
+    return error(res, 404, 'ACCOUNT_NOT_FOUND',
+      'No access account found for this session. Please re-register.');
 
   return success(res, {
-    account: {
-      full_name:    account.full_name,
-      email:        account.email,
-      organisation: account.organisation,
-      role:         account.role,
-      registered_at: account.created_at,
+    api:    'HealthAPI',
+    version: API_VER,
+    status: 'ACTIVE',
+
+    practitioner: {
+      name:          account.full_name,
+      email:         account.email,
+      role:          roleLabels[account.role] || account.role,
+      organisation:  account.organisation,
+      access_issued: account.created_at,
+      account_id:    account.id,
     },
-    oauth2_credentials: buildCredentialBlock(account.client_id, account.client_secret),
-    postman_setup:      buildPostmanBlock(account.client_id, account.client_secret),
-  }, 'Your HealthAPI credentials.');
+
+    access_credentials: buildAccessBlock(account.client_id, account.client_secret),
+
+    integration_guide: buildIntegrationGuide(account.client_id, account.client_secret),
+  }, 'Active integration credentials for your account.');
 };
 
 // ─────────────────────────────────────────────────────────────
-//  POST /api/register/regenerate  (session token required)
+//  POST /api/register/regenerate
 // ─────────────────────────────────────────────────────────────
 const regenerateSecret = async (req, res) => {
   const { data: account } = await supabase
     .from('api_tester_accounts')
-    .select('client_id')
+    .select('client_id, full_name, organisation, role')
     .eq('id', req.tester.id)
     .single();
 
-  if (!account) return error(res, 404, 'NOT_FOUND', 'Account not found.');
+  if (!account)
+    return error(res, 404, 'ACCOUNT_NOT_FOUND', 'Account not found.');
 
-  const newSecret = generateClientSecret();
+  const newSecret   = generateClientSecret();
+  const rotatedAt   = new Date().toISOString();
 
   await Promise.all([
     supabase.from('api_tester_accounts')
@@ -244,10 +309,26 @@ const regenerateSecret = async (req, res) => {
   ]);
 
   return success(res, {
-    oauth2_credentials: buildCredentialBlock(account.client_id, newSecret),
-    postman_setup:      buildPostmanBlock(account.client_id, newSecret),
-    warning: 'Your previous client_secret is now invalid. Update Postman with the new one above.',
-  }, 'Client secret regenerated successfully.');
+    api:    'HealthAPI',
+    version: API_VER,
+    status: 'SECRET_ROTATED',
+
+    practitioner: {
+      name:         account.full_name,
+      organisation: account.organisation,
+      role:         roleLabels[account.role] || account.role,
+    },
+
+    access_credentials: buildAccessBlock(account.client_id, newSecret),
+
+    integration_guide: buildIntegrationGuide(account.client_id, newSecret),
+
+    security_notice: {
+      rotated_at:      rotatedAt,
+      previous_secret: 'INVALIDATED',
+      action_required: 'Update your client_secret immediately in all integration configurations. All active tokens issued under the previous secret will be rejected on next use.',
+    },
+  }, 'Client secret rotated. Previous secret has been invalidated immediately.');
 };
 
 module.exports = { register, login, me, regenerateSecret };
