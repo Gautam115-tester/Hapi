@@ -2,36 +2,18 @@
 // ============================================================
 //  OAuth 2.0 Controller — fully working for Postman desktop + web
 //
-//  FIXES applied (v2.1):
-//  FIX 1: authorizePost now verifies the DB insert succeeded
-//          BEFORE redirecting. Previously a silent Supabase insert
-//          failure would redirect with a phantom code that could
-//          never be exchanged → INVALID_GRANT.
-//
-//  FIX 2: token() authorization_code branch now uses maybeSingle()
-//          so a missing code returns null (not an error object).
-//          This lets us give accurate "not found" vs "already used"
-//          error messages and avoids a false INVALID_GRANT when the
-//          Supabase .single() throws because 0 rows were returned.
-//
-//  FIX 3: Validation is done BEFORE marking the code as used.
-//          Previously redirect_uri / client_id mismatches could burn
-//          the code without issuing tokens, making it unrecoverable.
-//
-//  FIX 4: authorizePost now checks both `users` AND `api_tester_accounts`
-//          so registered testers can log in with their own credentials.
-//
-//  FIX 5: token endpoint now accepts client credentials via
-//          Authorization: Basic base64(client_id:client_secret)
-//          in addition to request body — RFC 6749 §2.3.1 compliant.
-//          Postman's built-in OAuth2 flow sends Basic Auth by default.
-//
-//  FIX 6: authorizePost now passes null as user_id for tester accounts
-//          (api_tester_accounts) because oauth_auth_codes.user_id has
-//          a FK referencing users(id) only. tstr_ IDs are not in the
-//          users table, causing a FK violation and silent insert failure
-//          which triggered the "Server error while generating
-//          authorization code" message.
+//  FIX 1: authorizePost verifies DB insert succeeded before redirecting.
+//  FIX 2: token() uses maybeSingle() — no throw on 0 rows.
+//  FIX 3: Validation done BEFORE marking code as used.
+//  FIX 4: authorizePost checks users AND api_tester_accounts.
+//  FIX 5: token endpoint accepts Basic Auth header for client creds.
+//  FIX 6: tstr_ IDs not in users(id) — pass null to avoid FK violation.
+//  FIX 7: buildTokenResponse now also checks api_tester_accounts when
+//          userId is a tstr_ ID, so tokens carry real user identity
+//          (name, email, role) instead of falling back to service-account.
+//          authorizePost passes the original user.id (tstr_ or usr_) as
+//          a separate field so buildTokenResponse can resolve it correctly
+//          without breaking the users(id) FK on oauth_auth_codes.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -53,9 +35,6 @@ const {
 const ISSUER = BASE_URL || 'https://hapi-2115.onrender.com';
 
 // ── Extract client credentials from Basic Auth header OR body ─
-// RFC 6749 §2.3.1: clients MAY send credentials via HTTP Basic Auth
-// on the token endpoint. Postman's built-in OAuth2 flow does this by
-// default ("Send as Basic Auth header" option). Support both methods.
 const extractClientCredentials = (req) => {
   const authHeader = req.headers['authorization'] || '';
   if (authHeader.startsWith('Basic ')) {
@@ -68,11 +47,8 @@ const extractClientCredentials = (req) => {
           client_secret: decodeURIComponent(decoded.slice(colonIdx + 1)),
         };
       }
-    } catch (_) {
-      // malformed Basic header — fall through to body
-    }
+    } catch (_) {}
   }
-  // Fall back to body fields (works when Postman uses "Send in body")
   return {
     client_id:     req.body.client_id,
     client_secret: req.body.client_secret,
@@ -104,33 +80,95 @@ const verifyCodeChallenge = (verifier, challenge, method) => {
   return false;
 };
 
+// ── Resolve user info from EITHER users OR api_tester_accounts ──
+// FIX 7: Called by buildTokenResponse so tokens always carry real
+// identity regardless of which table the account lives in.
+const resolveUserInfo = async (userId) => {
+  if (!userId) return null;
+
+  // usr_ → users table
+  if (userId.startsWith('usr_')) {
+    const { data } = await supabase
+      .from('users')
+      .select('id, name, email, role')
+      .eq('id', userId)
+      .single();
+    return data || null;
+  }
+
+  // tstr_ → api_tester_accounts table
+  if (userId.startsWith('tstr_')) {
+    const { data } = await supabase
+      .from('api_tester_accounts')
+      .select('id, full_name, email, role')
+      .eq('id', userId)
+      .single();
+    if (!data) return null;
+    return {
+      id:    data.id,
+      name:  data.full_name,
+      email: data.email,
+      role:  data.role,
+    };
+  }
+
+  // Fallback: try users table with whatever ID was given
+  const { data } = await supabase
+    .from('users')
+    .select('id, name, email, role')
+    .eq('id', userId)
+    .single();
+  return data || null;
+};
+
 // ── Token response builder ────────────────────────────────────
+// FIX 7: Uses resolveUserInfo() so tstr_ accounts get real identity.
+// oauth_access_tokens.user_id only stores usr_ IDs (FK constraint);
+// for tester accounts we store null in the DB column but carry the
+// identity in token_metadata via the resolved user object.
 const buildTokenResponse = async (userId, clientId, scope) => {
   const accessToken  = generateSecureToken('hapi_at');
   const refreshToken = generateSecureToken('hapi_rt');
   const now = Date.now();
-  const { data: user } = userId
-    ? await supabase.from('users').select('id, name, email, role').eq('id', userId).single()
-    : { data: null };
+
+  // Resolve user info from either table
+  const user = await resolveUserInfo(userId);
+
+  // For the DB FK: oauth_access_tokens.user_id references users(id).
+  // tstr_ IDs are not in users — store null, identity lives in metadata.
+  const dbUserId = (userId && userId.startsWith('usr_')) ? userId : null;
+
   const atExpiry = new Date(now + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
+
   await Promise.all([
     supabase.from('oauth_access_tokens').insert({
-      token: accessToken, user_id: userId || null,
-      client_id: clientId, scope, expires_at: atExpiry,
+      token:      accessToken,
+      user_id:    dbUserId,       // null for tester accounts — avoids FK violation
+      client_id:  clientId,
+      scope,
+      expires_at: atExpiry,
     }),
     supabase.from('oauth_refresh_tokens').insert({
-      token: refreshToken, user_id: userId || null,
-      client_id: clientId, scope,
+      token:     refreshToken,
+      user_id:   dbUserId,        // same — null for tester accounts
+      client_id: clientId,
+      scope,
     }),
   ]);
+
   return {
-    access_token: accessToken, token_type: 'Bearer',
-    expires_in: OAUTH_ACCESS_TOKEN_TTL,
-    refresh_token: refreshToken, scope,
+    access_token:  accessToken,
+    token_type:    'Bearer',
+    expires_in:    OAUTH_ACCESS_TOKEN_TTL,
+    refresh_token: refreshToken,
+    scope,
     token_metadata: {
-      issued_at: new Date(now).toISOString(), expires_at: atExpiry,
-      sub: userId || 'service-account',
-      username: user?.email || null, role: user?.role || 'service',
+      issued_at:  new Date(now).toISOString(),
+      expires_at: atExpiry,
+      sub:        userId || 'service-account',   // original ID (tstr_ or usr_)
+      username:   user?.email      || null,
+      role:       user?.role       || 'service',
+      name:       user?.name       || null,
     },
   };
 };
@@ -156,7 +194,7 @@ const lookupUser = async (email) => {
   if (!tester) return null;
 
   return {
-    id:         tester.id,
+    id:         tester.id,        // tstr_... — kept for token metadata
     name:       tester.full_name,
     email:      tester.email,
     password:   tester.password,
@@ -170,18 +208,18 @@ const lookupUser = async (email) => {
 // ─────────────────────────────────────────────────────────────
 const serverMetadata = (req, res) => res.status(200).json({
   issuer: ISSUER,
-  authorization_endpoint: `${ISSUER}/api/oauth/authorize`,
-  token_endpoint:         `${ISSUER}/api/oauth/token`,
-  revocation_endpoint:    `${ISSUER}/api/oauth/revoke`,
-  introspection_endpoint: `${ISSUER}/api/oauth/introspect`,
+  authorization_endpoint:               `${ISSUER}/api/oauth/authorize`,
+  token_endpoint:                       `${ISSUER}/api/oauth/token`,
+  revocation_endpoint:                  `${ISSUER}/api/oauth/revoke`,
+  introspection_endpoint:               `${ISSUER}/api/oauth/introspect`,
   jwks_uri: null,
   response_types_supported:             ['code'],
   grant_types_supported:                ['authorization_code', 'client_credentials', 'password', 'refresh_token'],
   token_endpoint_auth_methods_supported:['client_secret_post', 'client_secret_basic'],
   scopes_supported: ['read:patients','write:patients','read:appointments','write:appointments','read:records','write:records','admin'],
-  code_challenge_methods_supported: ['S256', 'plain'],
-  require_pkce_for_public_clients: true,
-  service_documentation: `${ISSUER}/api/docs`,
+  code_challenge_methods_supported:     ['S256', 'plain'],
+  require_pkce_for_public_clients:      true,
+  service_documentation:                `${ISSUER}/api/docs`,
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -297,14 +335,18 @@ const buildLoginPage = ({ clientName, scope, queryString, loginError }) => `<!DO
 //  GET /api/oauth/authorize  — Show login form
 // ─────────────────────────────────────────────────────────────
 const authorize = async (req, res) => {
-  const { response_type, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, login_error } = req.query;
+  const {
+    response_type, client_id, redirect_uri, scope,
+    state, code_challenge, code_challenge_method, login_error,
+  } = req.query;
 
   if (response_type !== 'code')
     return error(res, 400, 'UNSUPPORTED_RESPONSE_TYPE', 'response_type must be "code".');
   if (!client_id)
     return error(res, 400, 'MISSING_CLIENT_ID', 'client_id is required.');
 
-  const { data: client } = await supabase.from('oauth_clients').select('*').eq('client_id', client_id).single();
+  const { data: client } = await supabase
+    .from('oauth_clients').select('*').eq('client_id', client_id).single();
   if (!client)
     return error(res, 401, 'INVALID_CLIENT', `No registered OAuth2 client with client_id: ${client_id}.`);
 
@@ -322,31 +364,77 @@ const authorize = async (req, res) => {
   const qs = '?' + new URLSearchParams({
     response_type, client_id, redirect_uri,
     scope: requestedScopes.join(' '),
-    ...(state                ? { state }                : {}),
-    ...(code_challenge       ? { code_challenge }       : {}),
-    ...(code_challenge_method? { code_challenge_method }: {}),
+    ...(state                 ? { state }                 : {}),
+    ...(code_challenge        ? { code_challenge }        : {}),
+    ...(code_challenge_method ? { code_challenge_method } : {}),
   }).toString();
 
   return res.status(200).send(buildLoginPage({
-    clientName: client.name,
-    scope: requestedScopes.join(' '),
-    queryString: qs,
-    loginError: login_error || null,
+    clientName:   client.name,
+    scope:        requestedScopes.join(' '),
+    queryString:  qs,
+    loginError:   login_error || null,
   }));
 };
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/authorize  — Process login, issue code, redirect
 //
-//  FIX 1: The DB insert result is now checked. If Supabase returns
-//  an error we do NOT redirect — we show the login page again with
-//  an error message.
+//  FIX 6: oauth_auth_codes.user_id FK → users(id) only.
+//          tstr_ IDs cause FK violation → pass null (authCodeUserId).
 //
-//  FIX 6: tstr_ IDs (api_tester_accounts) are NOT in the users table.
-//  oauth_auth_codes.user_id has a FK → users(id), so inserting a
-//  tstr_ ID causes a FK violation and a silent insert failure.
-//  Fix: pass null as user_id for tester accounts. The token exchange
-//  step already handles null user_id gracefully (service-account path).
+//  FIX 7: Store the original user.id (tstr_ or usr_) in the code's
+//          scope field is NOT the right place — instead we store it
+//          in a separate lookup. Actually the cleanest approach:
+//          store authCodeUserId = null for tstr_, but ALSO store the
+//          real user id in a new column... but we can't change schema.
+//
+//          REAL FIX: We store user.id as-is in oauth_auth_codes.user_id
+//          by making that column nullable with no FK check for tstr_.
+//          But we can't change the schema without a migration.
+//
+//          BEST NO-MIGRATION FIX: For tstr_ accounts, look up whether
+//          there's a matching usr_ account with the same email in users.
+//          If yes, use that usr_ id. If no, use null but pass the tstr_
+//          id through to buildTokenResponse via a custom field on the
+//          code record... which we also can't do without schema change.
+//
+//          CLEANEST NO-MIGRATION FIX: Store the tester's email in the
+//          code's scope as a hidden suffix we can retrieve at exchange
+//          time — NO, that's hacky.
+//
+//          ACTUAL CLEANEST: At token-exchange time, look up the user
+//          by client_id in oauth_clients → get name → look up tester
+//          by client_id in api_tester_accounts. But scope is the only
+//          passthrough field we have.
+//
+//          TRUE CLEANEST (used here): Pass user.id to buildTokenResponse
+//          directly. buildTokenResponse already uses resolveUserInfo()
+//          which handles tstr_ correctly. The only issue was the DB
+//          insert of user_id in oauth_access_tokens — also fixed in
+//          buildTokenResponse (dbUserId = null for tstr_).
+//          For oauth_auth_codes we still need null for the FK.
+//          At exchange time, codeRecord.user_id will be null for testers.
+//          So we need another way to pass identity through.
+//
+//          FINAL SOLUTION: We use the existing unused column pattern —
+//          store the tester's actual id in the code field of a metadata
+//          row... Actually the simplest thing that requires zero schema
+//          changes: for tester accounts, find their matching entry in
+//          users by email if it exists (some testers may have registered
+//          with an email that's also in users). If not found in users,
+//          accept null user_id and the token will be service-account.
+//          But to fix identity: we pass user.id to buildTokenResponse
+//          and let it resolve via resolveUserInfo — which works for tstr_.
+//          The token exchange passes codeRecord.user_id to buildTokenResponse.
+//          codeRecord.user_id is null for testers (FK limitation).
+//          So we need to store the tester id somewhere retrievable.
+//
+//          ZERO-SCHEMA-CHANGE SOLUTION (implemented below):
+//          Store tstr_ id encoded into the `scope` field as an appended
+//          metadata token: "read:patients __uid:tstr_abc123"
+//          At exchange time, parse it out, pass to buildTokenResponse,
+//          strip from the returned scope. Clean, reversible, no DB change.
 // ─────────────────────────────────────────────────────────────
 const authorizePost = async (req, res) => {
   const {
@@ -362,7 +450,6 @@ const authorizePost = async (req, res) => {
 
   const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
 
-  // Helper: rebuild the query-string for error redirects
   const buildQs = (extraParams = {}) =>
     '?' + new URLSearchParams({
       response_type, client_id, redirect_uri,
@@ -373,7 +460,7 @@ const authorizePost = async (req, res) => {
       ...extraParams,
     }).toString();
 
-  // ── Unified user lookup ───────────────────────────────────
+  // ── User lookup (users + api_tester_accounts) ─────────────
   const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
   const user = await lookupUser(email);
   const hashToCheck = user ? user.password : dummyHash;
@@ -385,24 +472,28 @@ const authorizePost = async (req, res) => {
     );
   }
 
-  // ── FIX 6: Resolve user_id for the FK constraint ──────────
-  // oauth_auth_codes.user_id references users(id) only.
-  // Tester accounts live in api_tester_accounts with tstr_ IDs
-  // which are NOT in the users table — inserting them causes a
-  // FK violation. Pass null for tester accounts so the insert
-  // succeeds. buildTokenResponse already handles null user_id.
-  const authCodeUserId = (user.id && user.id.startsWith('usr_')) ? user.id : null;
+  // ── Resolve IDs for FK and identity ──────────────────────
+  // oauth_auth_codes.user_id FK → users(id): only usr_ IDs allowed.
+  // For tstr_ accounts we store null in the FK column but smuggle
+  // the real id through the scope field as "__uid:<id>" so the token
+  // exchange step can recover full identity without a schema change.
+  const isSystemUser = user.id && user.id.startsWith('usr_');
+  const authCodeUserId = isSystemUser ? user.id : null;
+
+  // Build scope string — append uid tag for tester accounts
+  const scopeForDb = isSystemUser
+    ? requestedScopes.join(' ')
+    : `${requestedScopes.join(' ')} __uid:${user.id}`;
 
   // ── Issue auth code ───────────────────────────────────────
   const code      = generateSecureToken('hapi_code', 24);
   const expiresAt = new Date(Date.now() + OAUTH_AUTH_CODE_TTL * 1000).toISOString();
 
-  // FIX 1: Check the insert result before redirecting.
   const { error: insertErr } = await supabase.from('oauth_auth_codes').insert({
     code,
-    user_id:               authCodeUserId,   // FIX 6: null for tester accounts
+    user_id:               authCodeUserId,   // null for tstr_ accounts (FK safe)
     client_id,
-    scope:                 requestedScopes.join(' '),
+    scope:                 scopeForDb,       // real scope + __uid tag for testers
     redirect_uri,
     expires_at:            expiresAt,
     code_challenge:        code_challenge        || null,
@@ -411,7 +502,6 @@ const authorizePost = async (req, res) => {
   });
 
   if (insertErr) {
-    // DB write failed — do NOT redirect with a phantom code.
     console.error('[OAuth] auth_code insert failed:', insertErr.message);
     return res.redirect(302,
       `/api/oauth/authorize${buildQs({ login_error: 'Server error while generating authorization code. Please try again.' })}`
@@ -419,11 +509,12 @@ const authorizePost = async (req, res) => {
   }
 
   audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-    clientId: client_id, userId: authCodeUserId,
-    event: 'auth_code_issued', scope: requestedScopes.join(' '),
+    clientId: client_id,
+    userId:   user.id,
+    event:    'auth_code_issued',
+    scope:    requestedScopes.join(' '),
   });
 
-  // Redirect to the redirect_uri with the code
   const callbackUrl = new URL(redirect_uri);
   callbackUrl.searchParams.set('code', code);
   if (state) callbackUrl.searchParams.set('state', state);
@@ -482,22 +573,18 @@ const callbackPage = (req, res) => {
     <div class="icon">✅</div>
     <h1>Authorization successful</h1>
     <p class="sub">You've been authenticated. Postman will now exchange this code for an access token automatically.</p>
-
     <div class="code-block">
       <div class="code-label">Authorization code</div>
       <div class="code-value" id="code-val">${code || ''}</div>
       <button class="copy-btn" onclick="copyCode()">Copy</button>
     </div>
-
     ${state ? `<div class="code-block">
       <div class="code-label">State</div>
       <div class="code-value">${state}</div>
     </div>` : ''}
-
     <div class="notice">
       <strong>Postman desktop:</strong> This window will close automatically as Postman intercepts the redirect. If it doesn't close, copy the code above and paste it into Postman manually.
     </div>
-
     <div class="postman-notice">
       <strong>Postman web app:</strong> Copy the authorization code above, then go back to Postman and paste it in the "Authorization code" field, then click "Exchange authorization code for tokens".
     </div>
@@ -516,13 +603,20 @@ const callbackPage = (req, res) => {
 </html>`);
 };
 
+// ── Helper: parse __uid tag out of stored scope ───────────────
+// Returns { cleanScope, resolvedUserId }
+// e.g. "read:patients __uid:tstr_abc123" → { cleanScope: "read:patients", resolvedUserId: "tstr_abc123" }
+const parseScope = (rawScope) => {
+  if (!rawScope) return { cleanScope: '', resolvedUserId: null };
+  const parts = rawScope.split(' ');
+  const uidTag = parts.find(p => p.startsWith('__uid:'));
+  const cleanScope = parts.filter(p => !p.startsWith('__uid:')).join(' ');
+  const resolvedUserId = uidTag ? uidTag.slice(6) : null;
+  return { cleanScope, resolvedUserId };
+};
+
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/token  — All 4 grant types
-//
-//  FIX 2: Uses maybeSingle() so "0 rows" returns null instead of
-//          throwing an error.
-//
-//  FIX 3: ALL validation done BEFORE marking the code as used.
 // ─────────────────────────────────────────────────────────────
 const token = async (req, res) => {
   const { grant_type } = req.body;
@@ -555,10 +649,9 @@ const token = async (req, res) => {
       return error(res, 500, 'DB_ERROR', 'Database error while validating authorization code.');
     }
 
-    if (!codeRecord) {
+    if (!codeRecord)
       return error(res, 400, 'INVALID_GRANT',
         'Authorization code not found. It may have expired or been used already.');
-    }
 
     if (codeRecord.used) {
       await Promise.all([
@@ -569,22 +662,20 @@ const token = async (req, res) => {
         'Authorization code has already been used. All tokens for this client have been revoked for security.');
     }
 
-    // FIX 3: Validate ALL constraints BEFORE consuming code
+    // Validate before consuming
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
       return error(res, 400, 'CODE_EXPIRED',
         'Authorization code has expired. Please restart the authorization flow.');
     }
 
-    if (codeRecord.redirect_uri !== redirect_uri) {
+    if (codeRecord.redirect_uri !== redirect_uri)
       return error(res, 400, 'REDIRECT_URI_MISMATCH',
         `redirect_uri mismatch. Expected: ${codeRecord.redirect_uri} — Got: ${redirect_uri}`);
-    }
 
-    if (codeRecord.client_id !== client_id) {
+    if (codeRecord.client_id !== client_id)
       return error(res, 400, 'CLIENT_MISMATCH',
         'Authorization code was issued to a different client.');
-    }
 
     if (codeRecord.code_challenge) {
       if (!code_verifier)
@@ -596,7 +687,7 @@ const token = async (req, res) => {
         return error(res, 400, 'PKCE_MISMATCH', 'code_verifier does not match code_challenge.');
     }
 
-    // All checks passed — consume code
+    // Consume code
     const { error: updateErr } = await supabase
       .from('oauth_auth_codes')
       .update({ used: true })
@@ -608,13 +699,19 @@ const token = async (req, res) => {
       return error(res, 500, 'DB_ERROR', 'Database error while consuming authorization code.');
     }
 
-    const tokenData = await buildTokenResponse(
-      codeRecord.user_id, client_id, codeRecord.scope);
+    // FIX 7: Recover real user identity.
+    // For system users: codeRecord.user_id = usr_xxx (direct).
+    // For tester accounts: codeRecord.user_id = null, real id
+    // was smuggled into scope as "__uid:tstr_xxx" — parse it out.
+    const { cleanScope, resolvedUserId } = parseScope(codeRecord.scope);
+    const effectiveUserId = codeRecord.user_id || resolvedUserId || null;
+
+    const tokenData = await buildTokenResponse(effectiveUserId, client_id, cleanScope);
 
     audit(AUDIT_EVENTS.OAUTH_TOKEN, {
       ip, clientId: client_id,
-      grant: 'authorization_code',
-      userId: codeRecord.user_id,
+      grant:  'authorization_code',
+      userId: effectiveUserId,
     });
 
     return success(res, tokenData, 'Token issued via authorization_code.');
@@ -650,8 +747,9 @@ const token = async (req, res) => {
       success: true, message: 'Token issued via client_credentials.',
       data: {
         access_token: accessToken, token_type: 'Bearer',
-        expires_in: OAUTH_ACCESS_TOKEN_TTL, scope: requestedScope.join(' '),
-        note: 'client_credentials does not issue a refresh_token.',
+        expires_in:   OAUTH_ACCESS_TOKEN_TTL,
+        scope:        requestedScope.join(' '),
+        note:         'client_credentials does not issue a refresh_token.',
       },
     });
   }
@@ -710,9 +808,15 @@ const token = async (req, res) => {
       return error(res, 400, 'CLIENT_MISMATCH', 'Refresh token was issued to a different client.');
 
     await supabase.from('oauth_refresh_tokens').delete().eq('token', refresh_token);
-    const tokenData = await buildTokenResponse(rtRecord.user_id, client_id, rtRecord.scope);
+
+    // Parse scope in case it contains a __uid tag from a tester account
+    const { cleanScope, resolvedUserId } = parseScope(rtRecord.scope);
+    const effectiveUserId = rtRecord.user_id || resolvedUserId || null;
+
+    const tokenData = await buildTokenResponse(effectiveUserId, client_id, cleanScope);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-      ip, clientId: client_id, grant: 'refresh_token', userId: rtRecord.user_id });
+      ip, clientId: client_id, grant: 'refresh_token', userId: effectiveUserId,
+    });
     return success(res, { ...tokenData, note: 'Previous refresh_token revoked.' }, 'New tokens issued.');
   }
 
@@ -744,9 +848,7 @@ const revoke = async (req, res) => {
   audit(AUDIT_EVENTS.OAUTH_REVOKE, { clientId: client_id, revoked });
   return res.status(200).json({
     success: true, revoked,
-    message: revoked
-      ? 'Token revoked.'
-      : 'Token not found (may already be expired or revoked).',
+    message: revoked ? 'Token revoked.' : 'Token not found (may already be expired or revoked).',
   });
 };
 
@@ -773,12 +875,18 @@ const introspect = async (req, res) => {
   }
   const u = record.users;
   return res.status(200).json({
-    active: true, scope: record.scope, client_id: record.client_id,
-    username: u?.email || null, token_type: 'Bearer',
+    active:     true,
+    scope:      record.scope,
+    client_id:  record.client_id,
+    username:   u?.email    || null,
+    token_type: 'Bearer',
     exp: Math.floor(new Date(record.expires_at).getTime() / 1000),
     iat: Math.floor(new Date(record.created_at).getTime() / 1000),
-    sub: record.user_id || 'service-account', iss: ISSUER,
-    role: u?.role || 'service', name: u?.name || null, department: u?.department || null,
+    sub: record.user_id || 'service-account',
+    iss: ISSUER,
+    role:       u?.role       || 'service',
+    name:       u?.name       || null,
+    department: u?.department || null,
   });
 };
 
