@@ -25,6 +25,13 @@
 //          Authorization: Basic base64(client_id:client_secret)
 //          in addition to request body — RFC 6749 §2.3.1 compliant.
 //          Postman's built-in OAuth2 flow sends Basic Auth by default.
+//
+//  FIX 6: authorizePost now passes null as user_id for tester accounts
+//          (api_tester_accounts) because oauth_auth_codes.user_id has
+//          a FK referencing users(id) only. tstr_ IDs are not in the
+//          users table, causing a FK violation and silent insert failure
+//          which triggered the "Server error while generating
+//          authorization code" message.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -333,8 +340,13 @@ const authorize = async (req, res) => {
 //
 //  FIX 1: The DB insert result is now checked. If Supabase returns
 //  an error we do NOT redirect — we show the login page again with
-//  an error message. Previously a failed insert silently redirected
-//  with a phantom code that could never be exchanged.
+//  an error message.
+//
+//  FIX 6: tstr_ IDs (api_tester_accounts) are NOT in the users table.
+//  oauth_auth_codes.user_id has a FK → users(id), so inserting a
+//  tstr_ ID causes a FK violation and a silent insert failure.
+//  Fix: pass null as user_id for tester accounts. The token exchange
+//  step already handles null user_id gracefully (service-account path).
 // ─────────────────────────────────────────────────────────────
 const authorizePost = async (req, res) => {
   const {
@@ -373,6 +385,14 @@ const authorizePost = async (req, res) => {
     );
   }
 
+  // ── FIX 6: Resolve user_id for the FK constraint ──────────
+  // oauth_auth_codes.user_id references users(id) only.
+  // Tester accounts live in api_tester_accounts with tstr_ IDs
+  // which are NOT in the users table — inserting them causes a
+  // FK violation. Pass null for tester accounts so the insert
+  // succeeds. buildTokenResponse already handles null user_id.
+  const authCodeUserId = (user.id && user.id.startsWith('usr_')) ? user.id : null;
+
   // ── Issue auth code ───────────────────────────────────────
   const code      = generateSecureToken('hapi_code', 24);
   const expiresAt = new Date(Date.now() + OAUTH_AUTH_CODE_TTL * 1000).toISOString();
@@ -380,7 +400,7 @@ const authorizePost = async (req, res) => {
   // FIX 1: Check the insert result before redirecting.
   const { error: insertErr } = await supabase.from('oauth_auth_codes').insert({
     code,
-    user_id:               user.id,
+    user_id:               authCodeUserId,   // FIX 6: null for tester accounts
     client_id,
     scope:                 requestedScopes.join(' '),
     redirect_uri,
@@ -399,7 +419,7 @@ const authorizePost = async (req, res) => {
   }
 
   audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-    clientId: client_id, userId: user.id,
+    clientId: client_id, userId: authCodeUserId,
     event: 'auth_code_issued', scope: requestedScopes.join(' '),
   });
 
@@ -500,14 +520,9 @@ const callbackPage = (req, res) => {
 //  POST /api/oauth/token  — All 4 grant types
 //
 //  FIX 2: Uses maybeSingle() so "0 rows" returns null instead of
-//          throwing an error. This prevents Supabase's PostgREST
-//          "JSON object requested, multiple (or no) rows returned"
-//          error from masking the real INVALID_GRANT response.
+//          throwing an error.
 //
-//  FIX 3: ALL validation (expiry, redirect_uri, client_id, PKCE)
-//          is done BEFORE the code is marked as used. Previously
-//          a redirect_uri mismatch would burn the code without
-//          issuing tokens.
+//  FIX 3: ALL validation done BEFORE marking the code as used.
 // ─────────────────────────────────────────────────────────────
 const token = async (req, res) => {
   const { grant_type } = req.body;
@@ -529,16 +544,12 @@ const token = async (req, res) => {
     if (!client.grant_types.includes('authorization_code'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for authorization_code.');
 
-    // ── FIX 2: use maybeSingle() — returns null when 0 rows, ─
-    //    no error thrown. .single() throws when row count ≠ 1,
-    //    which caused genuine "not found" to surface as a 500.
     const { data: codeRecord, error: codeErr } = await supabase
       .from('oauth_auth_codes')
       .select('*')
       .eq('code', code)
       .maybeSingle();
 
-    // Code not in DB at all — never existed or already deleted
     if (codeErr) {
       console.error('[OAuth] DB error fetching auth code:', codeErr.message);
       return error(res, 500, 'DB_ERROR', 'Database error while validating authorization code.');
@@ -549,9 +560,7 @@ const token = async (req, res) => {
         'Authorization code not found. It may have expired or been used already.');
     }
 
-    // Code was previously marked used — replay attack
     if (codeRecord.used) {
-      // Revoke all tokens issued to this client as a security measure
       await Promise.all([
         supabase.from('oauth_auth_codes').delete().eq('code', code),
         supabase.from('oauth_access_tokens').delete().eq('client_id', client_id),
@@ -560,10 +569,7 @@ const token = async (req, res) => {
         'Authorization code has already been used. All tokens for this client have been revoked for security.');
     }
 
-    // ── FIX 3: Validate ALL constraints BEFORE consuming code ─
-    // This ensures a bad request (wrong redirect_uri, expired code,
-    // PKCE mismatch) does NOT burn the code. The user can retry.
-
+    // FIX 3: Validate ALL constraints BEFORE consuming code
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
       return error(res, 400, 'CODE_EXPIRED',
@@ -590,12 +596,12 @@ const token = async (req, res) => {
         return error(res, 400, 'PKCE_MISMATCH', 'code_verifier does not match code_challenge.');
     }
 
-    // ── All checks passed — atomically consume & issue tokens ─
+    // All checks passed — consume code
     const { error: updateErr } = await supabase
       .from('oauth_auth_codes')
       .update({ used: true })
       .eq('code', code)
-      .eq('used', false); // extra guard: only update if still unused (concurrent request safety)
+      .eq('used', false);
 
     if (updateErr) {
       console.error('[OAuth] Failed to mark code as used:', updateErr.message);
