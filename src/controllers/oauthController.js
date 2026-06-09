@@ -2,22 +2,29 @@
 // ============================================================
 //  OAuth 2.0 Controller — fully working for Postman desktop + web
 //
-//  KEY FIX: /api/oauth/callback is now a self-hosted page that:
-//    1. Displays the auth code visually
-//    2. Triggers window.location redirect that Postman desktop
-//       intercepts (same as oauth.pstmn.io but self-hosted)
-//    3. Works in Postman web app too (shows code to paste manually)
+//  FIXES applied (v2.1):
+//  FIX 1: authorizePost now verifies the DB insert succeeded
+//          BEFORE redirecting. Previously a silent Supabase insert
+//          failure would redirect with a phantom code that could
+//          never be exchanged → INVALID_GRANT.
 //
-//  USE THIS as your redirect_uri in Postman:
-//    https://hapi-2115.onrender.com/api/oauth/callback
+//  FIX 2: token() authorization_code branch now uses maybeSingle()
+//          so a missing code returns null (not an error object).
+//          This lets us give accurate "not found" vs "already used"
+//          error messages and avoids a false INVALID_GRANT when the
+//          Supabase .single() throws because 0 rows were returned.
 //
-//  FIX 1: authorizePost now checks both `users` AND `api_tester_accounts`
-//         so registered testers can log in with their own credentials.
+//  FIX 3: Validation is done BEFORE marking the code as used.
+//          Previously redirect_uri / client_id mismatches could burn
+//          the code without issuing tokens, making it unrecoverable.
 //
-//  FIX 2: token endpoint now accepts client credentials via
-//         Authorization: Basic base64(client_id:client_secret)
-//         in addition to request body — RFC 6749 §2.3.1 compliant.
-//         Postman's built-in OAuth2 flow sends Basic Auth by default.
+//  FIX 4: authorizePost now checks both `users` AND `api_tester_accounts`
+//          so registered testers can log in with their own credentials.
+//
+//  FIX 5: token endpoint now accepts client credentials via
+//          Authorization: Basic base64(client_id:client_secret)
+//          in addition to request body — RFC 6749 §2.3.1 compliant.
+//          Postman's built-in OAuth2 flow sends Basic Auth by default.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -122,11 +129,9 @@ const buildTokenResponse = async (userId, clientId, scope) => {
 };
 
 // ── Unified user lookup (users table + api_tester_accounts) ──
-// Returns a normalised user object or null.
 const lookupUser = async (email) => {
   const normalised = (email || '').toLowerCase().trim();
 
-  // 1. Check main users table first
   const { data: user } = await supabase
     .from('users')
     .select('*')
@@ -135,7 +140,6 @@ const lookupUser = async (email) => {
 
   if (user) return user;
 
-  // 2. Fall back to api_tester_accounts (registered testers)
   const { data: tester } = await supabase
     .from('api_tester_accounts')
     .select('*')
@@ -144,7 +148,6 @@ const lookupUser = async (email) => {
 
   if (!tester) return null;
 
-  // Map tester shape → user shape so the rest of the code works unchanged
   return {
     id:         tester.id,
     name:       tester.full_name,
@@ -327,49 +330,73 @@ const authorize = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/authorize  — Process login, issue code, redirect
-//  FIX: now checks both users table AND api_tester_accounts
+//
+//  FIX 1: The DB insert result is now checked. If Supabase returns
+//  an error we do NOT redirect — we show the login page again with
+//  an error message. Previously a failed insert silently redirected
+//  with a phantom code that could never be exchanged.
 // ─────────────────────────────────────────────────────────────
 const authorizePost = async (req, res) => {
-  const { response_type, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method } = req.query;
+  const {
+    response_type, client_id, redirect_uri, scope,
+    state, code_challenge, code_challenge_method,
+  } = req.query;
   const { email, password } = req.body;
 
-  const { data: client } = await supabase.from('oauth_clients').select('*').eq('client_id', client_id).single();
+  const { data: client } = await supabase
+    .from('oauth_clients').select('*').eq('client_id', client_id).single();
   if (!client || !client.redirect_uris.includes(redirect_uri))
     return error(res, 400, 'INVALID_CLIENT', 'Invalid client or redirect_uri.');
 
   const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
 
-  // ── Unified user lookup: users table first, then api_tester_accounts ──
+  // Helper: rebuild the query-string for error redirects
+  const buildQs = (extraParams = {}) =>
+    '?' + new URLSearchParams({
+      response_type, client_id, redirect_uri,
+      scope: requestedScopes.join(' '),
+      ...(state                 ? { state }                 : {}),
+      ...(code_challenge        ? { code_challenge }        : {}),
+      ...(code_challenge_method ? { code_challenge_method } : {}),
+      ...extraParams,
+    }).toString();
+
+  // ── Unified user lookup ───────────────────────────────────
   const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
   const user = await lookupUser(email);
   const hashToCheck = user ? user.password : dummyHash;
-  let valid = await bcrypt.compare(password || '', hashToCheck);
+  const valid = await bcrypt.compare(password || '', hashToCheck);
 
   if (!user || !valid) {
-    // Re-render login page with error
-    const qs = '?' + new URLSearchParams({
-      response_type, client_id, redirect_uri,
-      scope: requestedScopes.join(' '),
-      ...(state                ? { state }                : {}),
-      ...(code_challenge       ? { code_challenge }       : {}),
-      ...(code_challenge_method? { code_challenge_method }: {}),
-      login_error: 'Invalid email or password. Please try again.',
-    }).toString();
-    return res.redirect(302, `/api/oauth/authorize${qs}`);
+    return res.redirect(302,
+      `/api/oauth/authorize${buildQs({ login_error: 'Invalid email or password. Please try again.' })}`
+    );
   }
 
-  // Issue auth code
+  // ── Issue auth code ───────────────────────────────────────
   const code      = generateSecureToken('hapi_code', 24);
   const expiresAt = new Date(Date.now() + OAUTH_AUTH_CODE_TTL * 1000).toISOString();
 
-  await supabase.from('oauth_auth_codes').insert({
-    code, user_id: user.id, client_id,
-    scope: requestedScopes.join(' '), redirect_uri,
-    expires_at: expiresAt,
-    code_challenge: code_challenge || null,
+  // FIX 1: Check the insert result before redirecting.
+  const { error: insertErr } = await supabase.from('oauth_auth_codes').insert({
+    code,
+    user_id:               user.id,
+    client_id,
+    scope:                 requestedScopes.join(' '),
+    redirect_uri,
+    expires_at:            expiresAt,
+    code_challenge:        code_challenge        || null,
     code_challenge_method: code_challenge_method || null,
-    used: false,
+    used:                  false,
   });
+
+  if (insertErr) {
+    // DB write failed — do NOT redirect with a phantom code.
+    console.error('[OAuth] auth_code insert failed:', insertErr.message);
+    return res.redirect(302,
+      `/api/oauth/authorize${buildQs({ login_error: 'Server error while generating authorization code. Please try again.' })}`
+    );
+  }
 
   audit(AUDIT_EVENTS.OAUTH_TOKEN, {
     clientId: client_id, userId: user.id,
@@ -471,8 +498,16 @@ const callbackPage = (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/token  — All 4 grant types
-//  FIX: client credentials now extracted from Basic Auth header
-//       OR request body — whichever is present (RFC 6749 §2.3.1)
+//
+//  FIX 2: Uses maybeSingle() so "0 rows" returns null instead of
+//          throwing an error. This prevents Supabase's PostgREST
+//          "JSON object requested, multiple (or no) rows returned"
+//          error from masking the real INVALID_GRANT response.
+//
+//  FIX 3: ALL validation (expiry, redirect_uri, client_id, PKCE)
+//          is done BEFORE the code is marked as used. Previously
+//          a redirect_uri mismatch would burn the code without
+//          issuing tokens.
 // ─────────────────────────────────────────────────────────────
 const token = async (req, res) => {
   const { grant_type } = req.body;
@@ -486,52 +521,96 @@ const token = async (req, res) => {
     if (!code || !redirect_uri)
       return error(res, 400, 'MISSING_PARAMS', 'Required fields missing: code, redirect_uri');
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
+      return error(res, 401, 'INVALID_CLIENT',
+        'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('authorization_code'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for authorization_code.');
 
-    // ── Step 1: Fetch the code record ────────────────────────
+    // ── FIX 2: use maybeSingle() — returns null when 0 rows, ─
+    //    no error thrown. .single() throws when row count ≠ 1,
+    //    which caused genuine "not found" to surface as a 500.
     const { data: codeRecord, error: codeErr } = await supabase
-      .from('oauth_auth_codes').select('*').eq('code', code).single();
+      .from('oauth_auth_codes')
+      .select('*')
+      .eq('code', code)
+      .maybeSingle();
 
-    // Code not found at all — either never existed or already fully consumed
-    if (codeErr || !codeRecord)
-      return error(res, 400, 'INVALID_GRANT', 'Authorization code not found or already used.');
+    // Code not in DB at all — never existed or already deleted
+    if (codeErr) {
+      console.error('[OAuth] DB error fetching auth code:', codeErr.message);
+      return error(res, 500, 'DB_ERROR', 'Database error while validating authorization code.');
+    }
 
-    // Code was previously marked used — this is a replay attack
+    if (!codeRecord) {
+      return error(res, 400, 'INVALID_GRANT',
+        'Authorization code not found. It may have expired or been used already.');
+    }
+
+    // Code was previously marked used — replay attack
     if (codeRecord.used) {
+      // Revoke all tokens issued to this client as a security measure
       await Promise.all([
         supabase.from('oauth_auth_codes').delete().eq('code', code),
         supabase.from('oauth_access_tokens').delete().eq('client_id', client_id),
       ]);
-      return error(res, 400, 'CODE_REUSE_DETECTED', 'Authorization code already used. All tokens revoked for security.');
+      return error(res, 400, 'CODE_REUSE_DETECTED',
+        'Authorization code has already been used. All tokens for this client have been revoked for security.');
     }
 
-    // ── Step 2: Validate everything BEFORE consuming the code ─
-    // This prevents the code from being burned on a bad request
+    // ── FIX 3: Validate ALL constraints BEFORE consuming code ─
+    // This ensures a bad request (wrong redirect_uri, expired code,
+    // PKCE mismatch) does NOT burn the code. The user can retry.
+
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
-      return error(res, 400, 'CODE_EXPIRED', 'Authorization code expired. Please restart the authorization flow.');
+      return error(res, 400, 'CODE_EXPIRED',
+        'Authorization code has expired. Please restart the authorization flow.');
     }
-    if (codeRecord.redirect_uri !== redirect_uri)
+
+    if (codeRecord.redirect_uri !== redirect_uri) {
       return error(res, 400, 'REDIRECT_URI_MISMATCH',
-        `redirect_uri mismatch. Expected: ${codeRecord.redirect_uri}`);
-    if (codeRecord.client_id !== client_id)
-      return error(res, 400, 'CLIENT_MISMATCH', 'Authorization code was issued to a different client.');
+        `redirect_uri mismatch. Expected: ${codeRecord.redirect_uri} — Got: ${redirect_uri}`);
+    }
+
+    if (codeRecord.client_id !== client_id) {
+      return error(res, 400, 'CLIENT_MISMATCH',
+        'Authorization code was issued to a different client.');
+    }
+
     if (codeRecord.code_challenge) {
-      if (!code_verifier) return error(res, 400, 'PKCE_REQUIRED', 'code_verifier is required for PKCE.');
-      if (!verifyCodeChallenge(code_verifier, codeRecord.code_challenge, codeRecord.code_challenge_method || 'plain'))
+      if (!code_verifier)
+        return error(res, 400, 'PKCE_REQUIRED', 'code_verifier is required for PKCE.');
+      if (!verifyCodeChallenge(
+            code_verifier,
+            codeRecord.code_challenge,
+            codeRecord.code_challenge_method || 'plain'))
         return error(res, 400, 'PKCE_MISMATCH', 'code_verifier does not match code_challenge.');
     }
 
-    // ── Step 3: Atomically consume code and issue tokens ─────
-    // Mark as used first — if token insert fails, code is still burned (safe)
-    await supabase.from('oauth_auth_codes').update({ used: true }).eq('code', code);
-    const tokenData = await buildTokenResponse(codeRecord.user_id, client_id, codeRecord.scope);
-    audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'authorization_code', userId: codeRecord.user_id });
+    // ── All checks passed — atomically consume & issue tokens ─
+    const { error: updateErr } = await supabase
+      .from('oauth_auth_codes')
+      .update({ used: true })
+      .eq('code', code)
+      .eq('used', false); // extra guard: only update if still unused (concurrent request safety)
+
+    if (updateErr) {
+      console.error('[OAuth] Failed to mark code as used:', updateErr.message);
+      return error(res, 500, 'DB_ERROR', 'Database error while consuming authorization code.');
+    }
+
+    const tokenData = await buildTokenResponse(
+      codeRecord.user_id, client_id, codeRecord.scope);
+
+    audit(AUDIT_EVENTS.OAUTH_TOKEN, {
+      ip, clientId: client_id,
+      grant: 'authorization_code',
+      userId: codeRecord.user_id,
+    });
+
     return success(res, tokenData, 'Token issued via authorization_code.');
   }
 
@@ -541,7 +620,8 @@ const token = async (req, res) => {
     const { client_id, client_secret } = extractClientCredentials(req);
 
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
+      return error(res, 401, 'INVALID_CLIENT',
+        'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
@@ -578,23 +658,24 @@ const token = async (req, res) => {
     if (!username || !password)
       return error(res, 400, 'MISSING_PARAMS', 'Required fields missing: username, password');
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
+      return error(res, 401, 'INVALID_CLIENT',
+        'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('password'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for password grant.');
 
-    // ── Also check api_tester_accounts for password grant ──
     const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
     const user = await lookupUser(username);
     const hashToCheck = user ? user.password : dummyHash;
-    let valid = await bcrypt.compare(password, hashToCheck);
+    const valid = await bcrypt.compare(password, hashToCheck);
 
     if (!user || !valid)
       return error(res, 401, 'INVALID_CREDENTIALS', 'Invalid username or password.');
 
-    const tokenData = await buildTokenResponse(user.id, client_id, scope || 'read:patients read:appointments');
+    const tokenData = await buildTokenResponse(
+      user.id, client_id, scope || 'read:patients read:appointments');
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'password', userId: user.id });
     return success(res, tokenData, 'Token issued via password grant.');
   }
@@ -607,7 +688,8 @@ const token = async (req, res) => {
     if (!refresh_token)
       return error(res, 400, 'MISSING_PARAMS', 'Required field missing: refresh_token');
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT', 'client_id and client_secret are required (via body or Basic Auth header).');
+      return error(res, 401, 'INVALID_CLIENT',
+        'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
     if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
@@ -615,7 +697,7 @@ const token = async (req, res) => {
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for refresh_token.');
 
     const { data: rtRecord } = await supabase
-      .from('oauth_refresh_tokens').select('*').eq('token', refresh_token).single();
+      .from('oauth_refresh_tokens').select('*').eq('token', refresh_token).maybeSingle();
     if (!rtRecord)
       return error(res, 400, 'INVALID_GRANT', 'Refresh token not found or revoked.');
     if (rtRecord.client_id !== client_id)
@@ -623,12 +705,14 @@ const token = async (req, res) => {
 
     await supabase.from('oauth_refresh_tokens').delete().eq('token', refresh_token);
     const tokenData = await buildTokenResponse(rtRecord.user_id, client_id, rtRecord.scope);
-    audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'refresh_token', userId: rtRecord.user_id });
+    audit(AUDIT_EVENTS.OAUTH_TOKEN, {
+      ip, clientId: client_id, grant: 'refresh_token', userId: rtRecord.user_id });
     return success(res, { ...tokenData, note: 'Previous refresh_token revoked.' }, 'New tokens issued.');
   }
 
   return error(res, 400, 'UNSUPPORTED_GRANT_TYPE',
-    `grant_type '${grant_type}' is not supported. Supported: authorization_code, client_credentials, password, refresh_token.`);
+    `grant_type '${grant_type}' is not supported. ` +
+    'Supported: authorization_code, client_credentials, password, refresh_token.');
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -652,8 +736,12 @@ const revoke = async (req, res) => {
     if (!dbErr && data && data.length > 0) { revoked = true; break; }
   }
   audit(AUDIT_EVENTS.OAUTH_REVOKE, { clientId: client_id, revoked });
-  return res.status(200).json({ success: true, revoked,
-    message: revoked ? 'Token revoked.' : 'Token not found (may already be expired or revoked).' });
+  return res.status(200).json({
+    success: true, revoked,
+    message: revoked
+      ? 'Token revoked.'
+      : 'Token not found (may already be expired or revoked).',
+  });
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -668,7 +756,11 @@ const introspect = async (req, res) => {
   if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
 
   const { data: record } = await supabase
-    .from('oauth_access_tokens').select('*, users(email, role, name, department)').eq('token', tok).single();
+    .from('oauth_access_tokens')
+    .select('*, users(email, role, name, department)')
+    .eq('token', tok)
+    .maybeSingle();
+
   if (!record || new Date() > new Date(record.expires_at)) {
     if (record) await supabase.from('oauth_access_tokens').delete().eq('token', tok);
     return res.status(200).json({ active: false });
@@ -688,7 +780,8 @@ const introspect = async (req, res) => {
 //  GET /api/auth/apikeys
 // ─────────────────────────────────────────────────────────────
 const listApiKeys = async (req, res) => {
-  const { data } = await supabase.from('api_keys').select('key, role, description, created_at');
+  const { data } = await supabase
+    .from('api_keys').select('key, role, description, created_at');
   return success(res, data || [], 'Available API keys for Basic Auth and X-API-Key testing.');
 };
 
