@@ -9,12 +9,12 @@
 //  FIX 5: token endpoint accepts Basic Auth header for client creds.
 //  FIX 6: tstr_ IDs not in users(id) — pass null to avoid FK violation.
 //  FIX 7: buildTokenResponse resolves tester identity via resolveUserInfo.
-//  FIX 8: introspect now resolves tester identity via client_id lookup
-//         when user_id is null (tester token), so introspection returns
-//         correct username/role/name instead of nulls.
-//  FIX 9: scope field in all responses strips the internal __uid tag
-//         so callers never see "__uid:tstr_xxx" in the scope string.
-//  FIX 10: client_credentials access_token stores scope without __uid.
+//  FIX 8: introspect resolves tester identity via client_id lookup.
+//  FIX 9: scope field strips internal __uid tag from all responses.
+//  FIX 10: POST /api/oauth/token returns FLAT RFC 6749 response
+//          (access_token at root level, NOT nested under 'data').
+//          Postman's OAuth2 engine cannot find access_token when nested —
+//          "Use Token" button stays disabled. RFC 6749 §5.1 requires flat.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -42,6 +42,16 @@ const cleanScope = (rawScope) => {
   return rawScope.split(' ').filter(s => s && !s.startsWith('__uid:')).join(' ');
 };
 
+// ── FIX 10: RFC 6749 §5.1 flat token response ────────────────
+// Postman's OAuth2 parser looks for access_token at the ROOT level.
+// Wrapping in { success, data: { access_token } } breaks Postman's
+// "Use Token" button — it stays greyed out and the token is unusable.
+// All other endpoints keep the {success, message, data} envelope.
+// Only POST /api/oauth/token uses this flat format (per spec).
+const tokenResponse = (res, payload, status = 200) => {
+  return res.status(status).json(payload);
+};
+
 // ── Extract client credentials from Basic Auth header OR body ─
 const extractClientCredentials = (req) => {
   const authHeader = req.headers['authorization'] || '';
@@ -61,6 +71,14 @@ const extractClientCredentials = (req) => {
     client_id:     req.body.client_id,
     client_secret: req.body.client_secret,
   };
+};
+
+// ── RFC 6749 §5.2 flat error response for token endpoint ─────
+const tokenError = (res, status, code, description) => {
+  return res.status(status).json({
+    error:             code,
+    error_description: description,
+  });
 };
 
 // ── Client credential validation ─────────────────────────────
@@ -120,7 +138,7 @@ const resolveUserInfo = async (userId) => {
 };
 
 // ── FIX 8: Resolve tester identity by client_id ──────────────
-// Used by introspect when user_id is null (tester token).
+// Used by introspect + client_credentials when user_id is null.
 const resolveTesterByClientId = async (clientId) => {
   if (!clientId) return null;
   const { data } = await supabase
@@ -133,6 +151,9 @@ const resolveTesterByClientId = async (clientId) => {
 };
 
 // ── Token response builder ────────────────────────────────────
+// Returns a FLAT RFC 6749 object (not wrapped in {success,data}).
+// token_metadata is extra — clients that understand it use it;
+// Postman simply ignores unknown fields (per JSON spec).
 const buildTokenResponse = async (userId, clientId, rawScope) => {
   const accessToken  = generateSecureToken('hapi_at');
   const refreshToken = generateSecureToken('hapi_rt');
@@ -144,33 +165,35 @@ const buildTokenResponse = async (userId, clientId, rawScope) => {
   // tstr_ IDs are not in users — store null.
   const dbUserId = (userId && userId.startsWith('usr_')) ? userId : null;
 
-  // FIX 9: store clean scope (no __uid tag) in the DB
+  // Store clean scope (no __uid tag) in DB
   const scopeForDb = cleanScope(rawScope);
-
-  const atExpiry = new Date(now + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
+  const atExpiry   = new Date(now + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
 
   await Promise.all([
     supabase.from('oauth_access_tokens').insert({
       token:      accessToken,
       user_id:    dbUserId,
       client_id:  clientId,
-      scope:      scopeForDb,           // clean scope stored
+      scope:      scopeForDb,
       expires_at: atExpiry,
     }),
     supabase.from('oauth_refresh_tokens').insert({
       token:     refreshToken,
       user_id:   dbUserId,
       client_id: clientId,
-      scope:     scopeForDb,            // clean scope stored
+      scope:     scopeForDb,
     }),
   ]);
 
+  // ── FIX 10: FLAT RFC 6749 §5.1 structure ─────────────────
   return {
     access_token:  accessToken,
     token_type:    'Bearer',
     expires_in:    OAUTH_ACCESS_TOKEN_TTL,
     refresh_token: refreshToken,
-    scope:         scopeForDb,          // FIX 9: consumer never sees __uid tag
+    scope:         scopeForDb,
+    // token_metadata is non-standard but harmless — Postman ignores it,
+    // students and API clients use it to inspect the token's identity.
     token_metadata: {
       issued_at:  new Date(now).toISOString(),
       expires_at: atExpiry,
@@ -215,8 +238,8 @@ const lookupUser = async (email) => {
 // ── Helper: parse __uid tag out of stored scope ───────────────
 const parseScope = (rawScope) => {
   if (!rawScope) return { cleanScope: '', resolvedUserId: null };
-  const parts = rawScope.split(' ');
-  const uidTag = parts.find(p => p.startsWith('__uid:'));
+  const parts      = rawScope.split(' ');
+  const uidTag     = parts.find(p => p.startsWith('__uid:'));
   const scopeClean = parts.filter(p => !p.startsWith('__uid:')).join(' ');
   const resolvedUserId = uidTag ? uidTag.slice(6) : null;
   return { cleanScope: scopeClean, resolvedUserId };
@@ -317,7 +340,7 @@ const buildLoginPage = ({ clientName, scope, queryString, loginError }) => `<!DO
     </div>
     <h1>Sign in to authorize</h1>
     <p class="subtitle"><strong>${clientName || 'An application'}</strong> is requesting access to your HealthAPI account.</p>
-    ${scope ? `<div class="scope-box"><strong>Requested permissions</strong><div class="scope-tags">${scope.split(' ').filter(s => !s.startsWith('__uid:')).map(s => `<span class="scope-tag">${s}</span>`).join('')}</div></div>` : ''}
+    ${scope ? `<div class="scope-box"><strong>Requested permissions</strong><div class="scope-tags">${scope.split(' ').filter(s => s && !s.startsWith('__uid:')).map(s => `<span class="scope-tag">${s}</span>`).join('')}</div></div>` : ''}
     ${loginError ? `<div class="error">⚠️ ${loginError}</div>` : ''}
     <form method="POST" action="/api/oauth/authorize${queryString}">
       <label for="email">Email address</label>
@@ -411,7 +434,6 @@ const authorizePost = async (req, res) => {
   if (!client || !client.redirect_uris.includes(redirect_uri))
     return error(res, 400, 'INVALID_CLIENT', 'Invalid client or redirect_uri.');
 
-  // FIX 9: strip any __uid tags from requested scopes before processing
   const requestedScopes = (scope || 'read:patients')
     .split(' ')
     .filter(s => s && !s.startsWith('__uid:'));
@@ -437,11 +459,9 @@ const authorizePost = async (req, res) => {
     );
   }
 
-  const isSystemUser = user.id && user.id.startsWith('usr_');
-  const authCodeUserId = isSystemUser ? user.id : null;
-
-  // Smuggle tester id through scope only if needed (no FK for tstr_ in auth_codes)
-  const scopeForDb = isSystemUser
+  const isSystemUser    = user.id && user.id.startsWith('usr_');
+  const authCodeUserId  = isSystemUser ? user.id : null;
+  const scopeForDb      = isSystemUser
     ? requestedScopes.join(' ')
     : `${requestedScopes.join(' ')} __uid:${user.id}`;
 
@@ -468,10 +488,8 @@ const authorizePost = async (req, res) => {
   }
 
   audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-    clientId: client_id,
-    userId:   user.id,
-    event:    'auth_code_issued',
-    scope:    requestedScopes.join(' '),
+    clientId: client_id, userId: user.id,
+    event: 'auth_code_issued', scope: requestedScopes.join(' '),
   });
 
   const callbackUrl = new URL(redirect_uri);
@@ -564,6 +582,8 @@ const callbackPage = (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/token  — All 4 grant types
+//  FIX 10: ALL responses are FLAT RFC 6749 §5.1 format.
+//          access_token is at root level — Postman "Use Token" works.
 // ─────────────────────────────────────────────────────────────
 const token = async (req, res) => {
   const { grant_type } = req.body;
@@ -575,15 +595,15 @@ const token = async (req, res) => {
     const { client_id, client_secret } = extractClientCredentials(req);
 
     if (!code || !redirect_uri)
-      return error(res, 400, 'MISSING_PARAMS', 'Required fields missing: code, redirect_uri');
+      return tokenError(res, 400, 'invalid_request', 'Required fields missing: code, redirect_uri');
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT',
+      return tokenError(res, 401, 'invalid_client',
         'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
-    if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
+    if (!client) return tokenError(res, 401, 'invalid_client', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('authorization_code'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for authorization_code.');
+      return tokenError(res, 400, 'unauthorized_client', 'Client not authorized for authorization_code.');
 
     const { data: codeRecord, error: codeErr } = await supabase
       .from('oauth_auth_codes')
@@ -593,11 +613,11 @@ const token = async (req, res) => {
 
     if (codeErr) {
       console.error('[OAuth] DB error fetching auth code:', codeErr.message);
-      return error(res, 500, 'DB_ERROR', 'Database error while validating authorization code.');
+      return tokenError(res, 500, 'server_error', 'Database error while validating authorization code.');
     }
 
     if (!codeRecord)
-      return error(res, 400, 'INVALID_GRANT',
+      return tokenError(res, 400, 'invalid_grant',
         'Authorization code not found. It may have expired or been used already.');
 
     if (codeRecord.used) {
@@ -605,32 +625,32 @@ const token = async (req, res) => {
         supabase.from('oauth_auth_codes').delete().eq('code', code),
         supabase.from('oauth_access_tokens').delete().eq('client_id', client_id),
       ]);
-      return error(res, 400, 'CODE_REUSE_DETECTED',
-        'Authorization code has already been used. All tokens for this client have been revoked for security.');
+      return tokenError(res, 400, 'invalid_grant',
+        'Authorization code has already been used. All tokens for this client have been revoked.');
     }
 
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
-      return error(res, 400, 'CODE_EXPIRED',
+      return tokenError(res, 400, 'invalid_grant',
         'Authorization code has expired. Please restart the authorization flow.');
     }
 
     if (codeRecord.redirect_uri !== redirect_uri)
-      return error(res, 400, 'REDIRECT_URI_MISMATCH',
-        `redirect_uri mismatch. Expected: ${codeRecord.redirect_uri} — Got: ${redirect_uri}`);
+      return tokenError(res, 400, 'invalid_grant',
+        `redirect_uri mismatch. Expected: ${codeRecord.redirect_uri}`);
 
     if (codeRecord.client_id !== client_id)
-      return error(res, 400, 'CLIENT_MISMATCH',
+      return tokenError(res, 400, 'invalid_grant',
         'Authorization code was issued to a different client.');
 
     if (codeRecord.code_challenge) {
       if (!code_verifier)
-        return error(res, 400, 'PKCE_REQUIRED', 'code_verifier is required for PKCE.');
+        return tokenError(res, 400, 'invalid_request', 'code_verifier is required for PKCE.');
       if (!verifyCodeChallenge(
             code_verifier,
             codeRecord.code_challenge,
             codeRecord.code_challenge_method || 'plain'))
-        return error(res, 400, 'PKCE_MISMATCH', 'code_verifier does not match code_challenge.');
+        return tokenError(res, 400, 'invalid_grant', 'code_verifier does not match code_challenge.');
     }
 
     const { error: updateErr } = await supabase
@@ -641,22 +661,21 @@ const token = async (req, res) => {
 
     if (updateErr) {
       console.error('[OAuth] Failed to mark code as used:', updateErr.message);
-      return error(res, 500, 'DB_ERROR', 'Database error while consuming authorization code.');
+      return tokenError(res, 500, 'server_error', 'Database error while consuming authorization code.');
     }
 
-    // Recover real user identity — parse __uid from scope if present
     const { cleanScope: scopeFromCode, resolvedUserId } = parseScope(codeRecord.scope);
     const effectiveUserId = codeRecord.user_id || resolvedUserId || null;
 
+    // buildTokenResponse returns flat RFC 6749 object
     const tokenData = await buildTokenResponse(effectiveUserId, client_id, scopeFromCode);
 
     audit(AUDIT_EVENTS.OAUTH_TOKEN, {
-      ip, clientId: client_id,
-      grant:  'authorization_code',
-      userId: effectiveUserId,
+      ip, clientId: client_id, grant: 'authorization_code', userId: effectiveUserId,
     });
 
-    return success(res, tokenData, 'Token issued via authorization_code.');
+    // ── FIX 10: flat response — Postman "Use Token" activates ──
+    return tokenResponse(res, tokenData);
   }
 
   // ── client_credentials ────────────────────────────────────
@@ -665,21 +684,20 @@ const token = async (req, res) => {
     const { client_id, client_secret } = extractClientCredentials(req);
 
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT',
+      return tokenError(res, 401, 'invalid_client',
         'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
-    if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
+    if (!client) return tokenError(res, 401, 'invalid_client', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('client_credentials'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for client_credentials.');
+      return tokenError(res, 400, 'unauthorized_client', 'Client not authorized for client_credentials.');
 
-    // FIX 9: filter out any __uid tags from requested scope
     const requestedScope = (scope || 'read:patients')
       .split(' ')
       .filter(s => s && !s.startsWith('__uid:'));
-    const invalidScopes  = requestedScope.filter(s => !client.scopes.includes(s));
+    const invalidScopes = requestedScope.filter(s => !client.scopes.includes(s));
     if (invalidScopes.length)
-      return error(res, 400, 'INVALID_SCOPE', `Scope(s) not permitted: ${invalidScopes.join(', ')}`);
+      return tokenError(res, 400, 'invalid_scope', `Scope(s) not permitted: ${invalidScopes.join(', ')}`);
 
     const accessToken = generateSecureToken('hapi_cc');
     const expiresAt   = new Date(Date.now() + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
@@ -690,27 +708,25 @@ const token = async (req, res) => {
       scope: scopeStr, expires_at: expiresAt,
     });
 
-    // FIX 8: try to resolve tester identity for the metadata block
     const testerUser = await resolveTesterByClientId(client_id);
 
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'client_credentials' });
-    return res.status(200).json({
-      success: true, message: 'Token issued via client_credentials.',
-      data: {
-        access_token:  accessToken,
-        token_type:    'Bearer',
-        expires_in:    OAUTH_ACCESS_TOKEN_TTL,
-        scope:         scopeStr,
-        token_metadata: {
-          issued_at:  new Date().toISOString(),
-          expires_at: expiresAt,
-          sub:        testerUser?.id || 'service-account',
-          username:   testerUser?.email || null,
-          role:       testerUser?.role  || 'service',
-          name:       testerUser?.name  || null,
-        },
-        note: 'client_credentials does not issue a refresh_token.',
+
+    // ── FIX 10: flat response ──
+    return tokenResponse(res, {
+      access_token: accessToken,
+      token_type:   'Bearer',
+      expires_in:   OAUTH_ACCESS_TOKEN_TTL,
+      scope:        scopeStr,
+      token_metadata: {
+        issued_at:  new Date().toISOString(),
+        expires_at: expiresAt,
+        sub:        testerUser?.id || 'service-account',
+        username:   testerUser?.email || null,
+        role:       testerUser?.role  || 'service',
+        name:       testerUser?.name  || null,
       },
+      note: 'client_credentials does not issue a refresh_token.',
     });
   }
 
@@ -720,15 +736,15 @@ const token = async (req, res) => {
     const { client_id, client_secret } = extractClientCredentials(req);
 
     if (!username || !password)
-      return error(res, 400, 'MISSING_PARAMS', 'Required fields missing: username, password');
+      return tokenError(res, 400, 'invalid_request', 'Required fields missing: username, password');
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT',
+      return tokenError(res, 401, 'invalid_client',
         'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
-    if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
+    if (!client) return tokenError(res, 401, 'invalid_client', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('password'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for password grant.');
+      return tokenError(res, 400, 'unauthorized_client', 'Client not authorized for password grant.');
 
     const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
     const user = await lookupUser(username);
@@ -736,13 +752,15 @@ const token = async (req, res) => {
     const valid = await bcrypt.compare(password, hashToCheck);
 
     if (!user || !valid)
-      return error(res, 401, 'INVALID_CREDENTIALS', 'Invalid username or password.');
+      return tokenError(res, 401, 'invalid_grant', 'Invalid username or password.');
 
-    // FIX 9: clean scope before passing to buildTokenResponse
     const cleanedScope = cleanScope(scope || 'read:patients read:appointments');
-    const tokenData = await buildTokenResponse(user.id, client_id, cleanedScope);
+    const tokenData    = await buildTokenResponse(user.id, client_id, cleanedScope);
+
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'password', userId: user.id });
-    return success(res, tokenData, 'Token issued via password grant.');
+
+    // ── FIX 10: flat response ──
+    return tokenResponse(res, tokenData);
   }
 
   // ── refresh_token ─────────────────────────────────────────
@@ -751,38 +769,42 @@ const token = async (req, res) => {
     const { client_id, client_secret } = extractClientCredentials(req);
 
     if (!refresh_token)
-      return error(res, 400, 'MISSING_PARAMS', 'Required field missing: refresh_token');
+      return tokenError(res, 400, 'invalid_request', 'Required field missing: refresh_token');
     if (!client_id || !client_secret)
-      return error(res, 401, 'INVALID_CLIENT',
+      return tokenError(res, 401, 'invalid_client',
         'client_id and client_secret are required (via body or Basic Auth header).');
 
     const client = await validateClient(client_id, client_secret);
-    if (!client) return error(res, 401, 'INVALID_CLIENT', 'client_id or client_secret is incorrect.');
+    if (!client) return tokenError(res, 401, 'invalid_client', 'client_id or client_secret is incorrect.');
     if (!client.grant_types.includes('refresh_token'))
-      return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for refresh_token.');
+      return tokenError(res, 400, 'unauthorized_client', 'Client not authorized for refresh_token.');
 
     const { data: rtRecord } = await supabase
       .from('oauth_refresh_tokens').select('*').eq('token', refresh_token).maybeSingle();
     if (!rtRecord)
-      return error(res, 400, 'INVALID_GRANT', 'Refresh token not found or revoked.');
+      return tokenError(res, 400, 'invalid_grant', 'Refresh token not found or revoked.');
     if (rtRecord.client_id !== client_id)
-      return error(res, 400, 'CLIENT_MISMATCH', 'Refresh token was issued to a different client.');
+      return tokenError(res, 400, 'invalid_grant', 'Refresh token was issued to a different client.');
 
     await supabase.from('oauth_refresh_tokens').delete().eq('token', refresh_token);
 
-    // Scope is now already clean (stored clean since FIX 9)
-    // But handle legacy tokens that may still have __uid for safety
     const { cleanScope: scopeFromRt, resolvedUserId } = parseScope(rtRecord.scope);
     const effectiveUserId = rtRecord.user_id || resolvedUserId || null;
 
     const tokenData = await buildTokenResponse(effectiveUserId, client_id, scopeFromRt);
+
     audit(AUDIT_EVENTS.OAUTH_TOKEN, {
       ip, clientId: client_id, grant: 'refresh_token', userId: effectiveUserId,
     });
-    return success(res, { ...tokenData, note: 'Previous refresh_token revoked.' }, 'New tokens issued.');
+
+    // ── FIX 10: flat response, with note about rotation ──
+    return tokenResponse(res, {
+      ...tokenData,
+      note: 'Previous refresh_token has been rotated.',
+    });
   }
 
-  return error(res, 400, 'UNSUPPORTED_GRANT_TYPE',
+  return tokenError(res, 400, 'unsupported_grant_type',
     `grant_type '${grant_type}' is not supported. ` +
     'Supported: authorization_code, client_credentials, password, refresh_token.');
 };
@@ -816,8 +838,8 @@ const revoke = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/introspect
-//  FIX 8: When user_id is null (tester token), resolve identity
-//  from api_tester_accounts via client_id lookup.
+//  FIX 8: resolve tester identity via client_id when user_id is null.
+//  FIX 9: strip __uid from scope before returning.
 // ─────────────────────────────────────────────────────────────
 const introspect = async (req, res) => {
   const { token: tok } = req.body;
@@ -838,13 +860,11 @@ const introspect = async (req, res) => {
     return res.status(200).json({ active: false });
   }
 
-  // FIX 8: resolve tester identity when users join returns nothing
   let u = record.users;
   if (!u && record.client_id) {
     u = await resolveTesterByClientId(record.client_id);
   }
 
-  // FIX 9: strip __uid from scope before returning to caller
   const visibleScope = cleanScope(record.scope);
 
   return res.status(200).json({
