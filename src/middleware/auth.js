@@ -13,6 +13,13 @@
 //    - Scope-based authorization (in addition to role RBAC)
 //    - Audit trail for every auth decision
 //    - Lockout is email-based only (no IP) — student friendly
+//
+//  FIX: OAuth2 tokens issued to tester accounts (tstr_ IDs) have
+//       user_id = null in oauth_access_tokens (FK constraint on users).
+//       Real identity is stored in token_metadata columns via the
+//       __uid scope tag resolved at token-issue time. This middleware
+//       now falls back to api_tester_accounts when the users join
+//       returns null, so RBAC works correctly for tester tokens.
 // ============================================================
 
 const jwt      = require('jsonwebtoken');
@@ -40,6 +47,28 @@ const safeCompare = (a, b) => {
     return false;
   }
   return crypto.timingSafeEqual(bufA, bufB);
+};
+
+// ─────────────────────────────────────────────────────────────
+//  FIX: resolve user identity from api_tester_accounts
+//  Called when oauth_access_tokens.user_id is null (tester token).
+//  We look up by client_id since that's what we have on the record.
+// ─────────────────────────────────────────────────────────────
+const resolveTesterIdentity = async (clientId) => {
+  if (!clientId) return null;
+  const { data } = await supabase
+    .from('api_tester_accounts')
+    .select('id, full_name, email, role, organisation')
+    .eq('client_id', clientId)
+    .single();
+  if (!data) return null;
+  return {
+    id:         data.id,
+    name:       data.full_name,
+    email:      data.email,
+    role:       data.role,
+    department: data.organisation || null,
+  };
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -182,7 +211,14 @@ const handleBearer = async (req, res, next, authHeader) => {
         });
     }
 
-    const u = oauthRecord.users;
+    // ── FIX: resolve identity for tester accounts ──────────
+    // oauth_access_tokens.user_id is null for tester accounts (FK constraint).
+    // Fall back to api_tester_accounts lookup via client_id.
+    let u = oauthRecord.users;
+    if (!u && oauthRecord.client_id) {
+      u = await resolveTesterIdentity(oauthRecord.client_id);
+    }
+
     req.user = {
       id:         u ? u.id         : null,
       name:       u ? u.name       : 'service-account',
@@ -190,11 +226,13 @@ const handleBearer = async (req, res, next, authHeader) => {
       role:       u ? u.role       : 'service',
       department: u ? u.department : null,
     };
-    req.oauthScope = (oauthRecord.scope || '').split(' ').filter(Boolean);
+    req.oauthScope = (oauthRecord.scope || '')
+      .split(' ')
+      .filter(s => s && !s.startsWith('__uid:'));   // strip internal __uid tag from scope
     req.authMethod = 'bearer-oauth2';
     req.tokenMeta  = {
       clientId:  oauthRecord.client_id,
-      scope:     oauthRecord.scope,
+      scope:     req.oauthScope.join(' '),
       expiresAt: oauthRecord.expires_at,
     };
 

@@ -8,12 +8,13 @@
 //  FIX 4: authorizePost checks users AND api_tester_accounts.
 //  FIX 5: token endpoint accepts Basic Auth header for client creds.
 //  FIX 6: tstr_ IDs not in users(id) — pass null to avoid FK violation.
-//  FIX 7: buildTokenResponse now also checks api_tester_accounts when
-//          userId is a tstr_ ID, so tokens carry real user identity
-//          (name, email, role) instead of falling back to service-account.
-//          authorizePost passes the original user.id (tstr_ or usr_) as
-//          a separate field so buildTokenResponse can resolve it correctly
-//          without breaking the users(id) FK on oauth_auth_codes.
+//  FIX 7: buildTokenResponse resolves tester identity via resolveUserInfo.
+//  FIX 8: introspect now resolves tester identity via client_id lookup
+//         when user_id is null (tester token), so introspection returns
+//         correct username/role/name instead of nulls.
+//  FIX 9: scope field in all responses strips the internal __uid tag
+//         so callers never see "__uid:tstr_xxx" in the scope string.
+//  FIX 10: client_credentials access_token stores scope without __uid.
 // ============================================================
 
 const crypto   = require('crypto');
@@ -33,6 +34,13 @@ const {
 } = require('../utils/authSecurity');
 
 const ISSUER = BASE_URL || 'https://hapi-2115.onrender.com';
+
+// ── Strip the internal __uid tag from any scope string ───────
+// Ensures __uid:tstr_xxx never leaks out to API consumers.
+const cleanScope = (rawScope) => {
+  if (!rawScope) return '';
+  return rawScope.split(' ').filter(s => s && !s.startsWith('__uid:')).join(' ');
+};
 
 // ── Extract client credentials from Basic Auth header OR body ─
 const extractClientCredentials = (req) => {
@@ -81,12 +89,9 @@ const verifyCodeChallenge = (verifier, challenge, method) => {
 };
 
 // ── Resolve user info from EITHER users OR api_tester_accounts ──
-// FIX 7: Called by buildTokenResponse so tokens always carry real
-// identity regardless of which table the account lives in.
 const resolveUserInfo = async (userId) => {
   if (!userId) return null;
 
-  // usr_ → users table
   if (userId.startsWith('usr_')) {
     const { data } = await supabase
       .from('users')
@@ -96,7 +101,6 @@ const resolveUserInfo = async (userId) => {
     return data || null;
   }
 
-  // tstr_ → api_tester_accounts table
   if (userId.startsWith('tstr_')) {
     const { data } = await supabase
       .from('api_tester_accounts')
@@ -104,15 +108,9 @@ const resolveUserInfo = async (userId) => {
       .eq('id', userId)
       .single();
     if (!data) return null;
-    return {
-      id:    data.id,
-      name:  data.full_name,
-      email: data.email,
-      role:  data.role,
-    };
+    return { id: data.id, name: data.full_name, email: data.email, role: data.role };
   }
 
-  // Fallback: try users table with whatever ID was given
   const { data } = await supabase
     .from('users')
     .select('id, name, email, role')
@@ -121,38 +119,49 @@ const resolveUserInfo = async (userId) => {
   return data || null;
 };
 
+// ── FIX 8: Resolve tester identity by client_id ──────────────
+// Used by introspect when user_id is null (tester token).
+const resolveTesterByClientId = async (clientId) => {
+  if (!clientId) return null;
+  const { data } = await supabase
+    .from('api_tester_accounts')
+    .select('id, full_name, email, role')
+    .eq('client_id', clientId)
+    .single();
+  if (!data) return null;
+  return { id: data.id, name: data.full_name, email: data.email, role: data.role };
+};
+
 // ── Token response builder ────────────────────────────────────
-// FIX 7: Uses resolveUserInfo() so tstr_ accounts get real identity.
-// oauth_access_tokens.user_id only stores usr_ IDs (FK constraint);
-// for tester accounts we store null in the DB column but carry the
-// identity in token_metadata via the resolved user object.
-const buildTokenResponse = async (userId, clientId, scope) => {
+const buildTokenResponse = async (userId, clientId, rawScope) => {
   const accessToken  = generateSecureToken('hapi_at');
   const refreshToken = generateSecureToken('hapi_rt');
   const now = Date.now();
 
-  // Resolve user info from either table
   const user = await resolveUserInfo(userId);
 
-  // For the DB FK: oauth_access_tokens.user_id references users(id).
-  // tstr_ IDs are not in users — store null, identity lives in metadata.
+  // FK constraint: oauth_access_tokens.user_id → users(id).
+  // tstr_ IDs are not in users — store null.
   const dbUserId = (userId && userId.startsWith('usr_')) ? userId : null;
+
+  // FIX 9: store clean scope (no __uid tag) in the DB
+  const scopeForDb = cleanScope(rawScope);
 
   const atExpiry = new Date(now + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
 
   await Promise.all([
     supabase.from('oauth_access_tokens').insert({
       token:      accessToken,
-      user_id:    dbUserId,       // null for tester accounts — avoids FK violation
+      user_id:    dbUserId,
       client_id:  clientId,
-      scope,
+      scope:      scopeForDb,           // clean scope stored
       expires_at: atExpiry,
     }),
     supabase.from('oauth_refresh_tokens').insert({
       token:     refreshToken,
-      user_id:   dbUserId,        // same — null for tester accounts
+      user_id:   dbUserId,
       client_id: clientId,
-      scope,
+      scope:     scopeForDb,            // clean scope stored
     }),
   ]);
 
@@ -161,14 +170,14 @@ const buildTokenResponse = async (userId, clientId, scope) => {
     token_type:    'Bearer',
     expires_in:    OAUTH_ACCESS_TOKEN_TTL,
     refresh_token: refreshToken,
-    scope,
+    scope:         scopeForDb,          // FIX 9: consumer never sees __uid tag
     token_metadata: {
       issued_at:  new Date(now).toISOString(),
       expires_at: atExpiry,
-      sub:        userId || 'service-account',   // original ID (tstr_ or usr_)
-      username:   user?.email      || null,
-      role:       user?.role       || 'service',
-      name:       user?.name       || null,
+      sub:        userId || 'service-account',
+      username:   user?.email || null,
+      role:       user?.role  || 'service',
+      name:       user?.name  || null,
     },
   };
 };
@@ -194,13 +203,23 @@ const lookupUser = async (email) => {
   if (!tester) return null;
 
   return {
-    id:         tester.id,        // tstr_... — kept for token metadata
+    id:         tester.id,
     name:       tester.full_name,
     email:      tester.email,
     password:   tester.password,
     role:       tester.role,
     department: tester.organisation || null,
   };
+};
+
+// ── Helper: parse __uid tag out of stored scope ───────────────
+const parseScope = (rawScope) => {
+  if (!rawScope) return { cleanScope: '', resolvedUserId: null };
+  const parts = rawScope.split(' ');
+  const uidTag = parts.find(p => p.startsWith('__uid:'));
+  const scopeClean = parts.filter(p => !p.startsWith('__uid:')).join(' ');
+  const resolvedUserId = uidTag ? uidTag.slice(6) : null;
+  return { cleanScope: scopeClean, resolvedUserId };
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -298,7 +317,7 @@ const buildLoginPage = ({ clientName, scope, queryString, loginError }) => `<!DO
     </div>
     <h1>Sign in to authorize</h1>
     <p class="subtitle"><strong>${clientName || 'An application'}</strong> is requesting access to your HealthAPI account.</p>
-    ${scope ? `<div class="scope-box"><strong>Requested permissions</strong><div class="scope-tags">${scope.split(' ').map(s => `<span class="scope-tag">${s}</span>`).join('')}</div></div>` : ''}
+    ${scope ? `<div class="scope-box"><strong>Requested permissions</strong><div class="scope-tags">${scope.split(' ').filter(s => !s.startsWith('__uid:')).map(s => `<span class="scope-tag">${s}</span>`).join('')}</div></div>` : ''}
     ${loginError ? `<div class="error">⚠️ ${loginError}</div>` : ''}
     <form method="POST" action="/api/oauth/authorize${queryString}">
       <label for="email">Email address</label>
@@ -356,7 +375,7 @@ const authorize = async (req, res) => {
     return error(res, 400, 'INVALID_REDIRECT_URI',
       `redirect_uri '${redirect_uri}' is not registered. Registered: ${client.redirect_uris.join(', ')}`);
 
-  const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
+  const requestedScopes = (scope || 'read:patients').split(' ').filter(s => s && !s.startsWith('__uid:'));
   const invalidScopes   = requestedScopes.filter(s => !client.scopes.includes(s));
   if (invalidScopes.length)
     return error(res, 400, 'INVALID_SCOPE', `Scopes not permitted: ${invalidScopes.join(', ')}`);
@@ -379,62 +398,6 @@ const authorize = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/authorize  — Process login, issue code, redirect
-//
-//  FIX 6: oauth_auth_codes.user_id FK → users(id) only.
-//          tstr_ IDs cause FK violation → pass null (authCodeUserId).
-//
-//  FIX 7: Store the original user.id (tstr_ or usr_) in the code's
-//          scope field is NOT the right place — instead we store it
-//          in a separate lookup. Actually the cleanest approach:
-//          store authCodeUserId = null for tstr_, but ALSO store the
-//          real user id in a new column... but we can't change schema.
-//
-//          REAL FIX: We store user.id as-is in oauth_auth_codes.user_id
-//          by making that column nullable with no FK check for tstr_.
-//          But we can't change the schema without a migration.
-//
-//          BEST NO-MIGRATION FIX: For tstr_ accounts, look up whether
-//          there's a matching usr_ account with the same email in users.
-//          If yes, use that usr_ id. If no, use null but pass the tstr_
-//          id through to buildTokenResponse via a custom field on the
-//          code record... which we also can't do without schema change.
-//
-//          CLEANEST NO-MIGRATION FIX: Store the tester's email in the
-//          code's scope as a hidden suffix we can retrieve at exchange
-//          time — NO, that's hacky.
-//
-//          ACTUAL CLEANEST: At token-exchange time, look up the user
-//          by client_id in oauth_clients → get name → look up tester
-//          by client_id in api_tester_accounts. But scope is the only
-//          passthrough field we have.
-//
-//          TRUE CLEANEST (used here): Pass user.id to buildTokenResponse
-//          directly. buildTokenResponse already uses resolveUserInfo()
-//          which handles tstr_ correctly. The only issue was the DB
-//          insert of user_id in oauth_access_tokens — also fixed in
-//          buildTokenResponse (dbUserId = null for tstr_).
-//          For oauth_auth_codes we still need null for the FK.
-//          At exchange time, codeRecord.user_id will be null for testers.
-//          So we need another way to pass identity through.
-//
-//          FINAL SOLUTION: We use the existing unused column pattern —
-//          store the tester's actual id in the code field of a metadata
-//          row... Actually the simplest thing that requires zero schema
-//          changes: for tester accounts, find their matching entry in
-//          users by email if it exists (some testers may have registered
-//          with an email that's also in users). If not found in users,
-//          accept null user_id and the token will be service-account.
-//          But to fix identity: we pass user.id to buildTokenResponse
-//          and let it resolve via resolveUserInfo — which works for tstr_.
-//          The token exchange passes codeRecord.user_id to buildTokenResponse.
-//          codeRecord.user_id is null for testers (FK limitation).
-//          So we need to store the tester id somewhere retrievable.
-//
-//          ZERO-SCHEMA-CHANGE SOLUTION (implemented below):
-//          Store tstr_ id encoded into the `scope` field as an appended
-//          metadata token: "read:patients __uid:tstr_abc123"
-//          At exchange time, parse it out, pass to buildTokenResponse,
-//          strip from the returned scope. Clean, reversible, no DB change.
 // ─────────────────────────────────────────────────────────────
 const authorizePost = async (req, res) => {
   const {
@@ -448,7 +411,10 @@ const authorizePost = async (req, res) => {
   if (!client || !client.redirect_uris.includes(redirect_uri))
     return error(res, 400, 'INVALID_CLIENT', 'Invalid client or redirect_uri.');
 
-  const requestedScopes = (scope || 'read:patients').split(' ').filter(Boolean);
+  // FIX 9: strip any __uid tags from requested scopes before processing
+  const requestedScopes = (scope || 'read:patients')
+    .split(' ')
+    .filter(s => s && !s.startsWith('__uid:'));
 
   const buildQs = (extraParams = {}) =>
     '?' + new URLSearchParams({
@@ -460,7 +426,6 @@ const authorizePost = async (req, res) => {
       ...extraParams,
     }).toString();
 
-  // ── User lookup (users + api_tester_accounts) ─────────────
   const dummyHash = '$2a$10$dummy.hash.to.prevent.timing.attacks.from.user.enumeration.';
   const user = await lookupUser(email);
   const hashToCheck = user ? user.password : dummyHash;
@@ -472,28 +437,22 @@ const authorizePost = async (req, res) => {
     );
   }
 
-  // ── Resolve IDs for FK and identity ──────────────────────
-  // oauth_auth_codes.user_id FK → users(id): only usr_ IDs allowed.
-  // For tstr_ accounts we store null in the FK column but smuggle
-  // the real id through the scope field as "__uid:<id>" so the token
-  // exchange step can recover full identity without a schema change.
   const isSystemUser = user.id && user.id.startsWith('usr_');
   const authCodeUserId = isSystemUser ? user.id : null;
 
-  // Build scope string — append uid tag for tester accounts
+  // Smuggle tester id through scope only if needed (no FK for tstr_ in auth_codes)
   const scopeForDb = isSystemUser
     ? requestedScopes.join(' ')
     : `${requestedScopes.join(' ')} __uid:${user.id}`;
 
-  // ── Issue auth code ───────────────────────────────────────
   const code      = generateSecureToken('hapi_code', 24);
   const expiresAt = new Date(Date.now() + OAUTH_AUTH_CODE_TTL * 1000).toISOString();
 
   const { error: insertErr } = await supabase.from('oauth_auth_codes').insert({
     code,
-    user_id:               authCodeUserId,   // null for tstr_ accounts (FK safe)
+    user_id:               authCodeUserId,
     client_id,
-    scope:                 scopeForDb,       // real scope + __uid tag for testers
+    scope:                 scopeForDb,
     redirect_uri,
     expires_at:            expiresAt,
     code_challenge:        code_challenge        || null,
@@ -603,18 +562,6 @@ const callbackPage = (req, res) => {
 </html>`);
 };
 
-// ── Helper: parse __uid tag out of stored scope ───────────────
-// Returns { cleanScope, resolvedUserId }
-// e.g. "read:patients __uid:tstr_abc123" → { cleanScope: "read:patients", resolvedUserId: "tstr_abc123" }
-const parseScope = (rawScope) => {
-  if (!rawScope) return { cleanScope: '', resolvedUserId: null };
-  const parts = rawScope.split(' ');
-  const uidTag = parts.find(p => p.startsWith('__uid:'));
-  const cleanScope = parts.filter(p => !p.startsWith('__uid:')).join(' ');
-  const resolvedUserId = uidTag ? uidTag.slice(6) : null;
-  return { cleanScope, resolvedUserId };
-};
-
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/token  — All 4 grant types
 // ─────────────────────────────────────────────────────────────
@@ -662,7 +609,6 @@ const token = async (req, res) => {
         'Authorization code has already been used. All tokens for this client have been revoked for security.');
     }
 
-    // Validate before consuming
     if (new Date() > new Date(codeRecord.expires_at)) {
       await supabase.from('oauth_auth_codes').delete().eq('code', code);
       return error(res, 400, 'CODE_EXPIRED',
@@ -687,7 +633,6 @@ const token = async (req, res) => {
         return error(res, 400, 'PKCE_MISMATCH', 'code_verifier does not match code_challenge.');
     }
 
-    // Consume code
     const { error: updateErr } = await supabase
       .from('oauth_auth_codes')
       .update({ used: true })
@@ -699,14 +644,11 @@ const token = async (req, res) => {
       return error(res, 500, 'DB_ERROR', 'Database error while consuming authorization code.');
     }
 
-    // FIX 7: Recover real user identity.
-    // For system users: codeRecord.user_id = usr_xxx (direct).
-    // For tester accounts: codeRecord.user_id = null, real id
-    // was smuggled into scope as "__uid:tstr_xxx" — parse it out.
-    const { cleanScope, resolvedUserId } = parseScope(codeRecord.scope);
+    // Recover real user identity — parse __uid from scope if present
+    const { cleanScope: scopeFromCode, resolvedUserId } = parseScope(codeRecord.scope);
     const effectiveUserId = codeRecord.user_id || resolvedUserId || null;
 
-    const tokenData = await buildTokenResponse(effectiveUserId, client_id, cleanScope);
+    const tokenData = await buildTokenResponse(effectiveUserId, client_id, scopeFromCode);
 
     audit(AUDIT_EVENTS.OAUTH_TOKEN, {
       ip, clientId: client_id,
@@ -731,25 +673,43 @@ const token = async (req, res) => {
     if (!client.grant_types.includes('client_credentials'))
       return error(res, 400, 'UNAUTHORIZED_GRANT_TYPE', 'Client not authorized for client_credentials.');
 
-    const requestedScope = (scope || 'read:patients').split(' ').filter(Boolean);
+    // FIX 9: filter out any __uid tags from requested scope
+    const requestedScope = (scope || 'read:patients')
+      .split(' ')
+      .filter(s => s && !s.startsWith('__uid:'));
     const invalidScopes  = requestedScope.filter(s => !client.scopes.includes(s));
     if (invalidScopes.length)
       return error(res, 400, 'INVALID_SCOPE', `Scope(s) not permitted: ${invalidScopes.join(', ')}`);
 
     const accessToken = generateSecureToken('hapi_cc');
     const expiresAt   = new Date(Date.now() + OAUTH_ACCESS_TOKEN_TTL * 1000).toISOString();
+    const scopeStr    = requestedScope.join(' ');
+
     await supabase.from('oauth_access_tokens').insert({
       token: accessToken, user_id: null, client_id,
-      scope: requestedScope.join(' '), expires_at: expiresAt,
+      scope: scopeStr, expires_at: expiresAt,
     });
+
+    // FIX 8: try to resolve tester identity for the metadata block
+    const testerUser = await resolveTesterByClientId(client_id);
+
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'client_credentials' });
     return res.status(200).json({
       success: true, message: 'Token issued via client_credentials.',
       data: {
-        access_token: accessToken, token_type: 'Bearer',
-        expires_in:   OAUTH_ACCESS_TOKEN_TTL,
-        scope:        requestedScope.join(' '),
-        note:         'client_credentials does not issue a refresh_token.',
+        access_token:  accessToken,
+        token_type:    'Bearer',
+        expires_in:    OAUTH_ACCESS_TOKEN_TTL,
+        scope:         scopeStr,
+        token_metadata: {
+          issued_at:  new Date().toISOString(),
+          expires_at: expiresAt,
+          sub:        testerUser?.id || 'service-account',
+          username:   testerUser?.email || null,
+          role:       testerUser?.role  || 'service',
+          name:       testerUser?.name  || null,
+        },
+        note: 'client_credentials does not issue a refresh_token.',
       },
     });
   }
@@ -778,8 +738,9 @@ const token = async (req, res) => {
     if (!user || !valid)
       return error(res, 401, 'INVALID_CREDENTIALS', 'Invalid username or password.');
 
-    const tokenData = await buildTokenResponse(
-      user.id, client_id, scope || 'read:patients read:appointments');
+    // FIX 9: clean scope before passing to buildTokenResponse
+    const cleanedScope = cleanScope(scope || 'read:patients read:appointments');
+    const tokenData = await buildTokenResponse(user.id, client_id, cleanedScope);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, { ip, clientId: client_id, grant: 'password', userId: user.id });
     return success(res, tokenData, 'Token issued via password grant.');
   }
@@ -809,11 +770,12 @@ const token = async (req, res) => {
 
     await supabase.from('oauth_refresh_tokens').delete().eq('token', refresh_token);
 
-    // Parse scope in case it contains a __uid tag from a tester account
-    const { cleanScope, resolvedUserId } = parseScope(rtRecord.scope);
+    // Scope is now already clean (stored clean since FIX 9)
+    // But handle legacy tokens that may still have __uid for safety
+    const { cleanScope: scopeFromRt, resolvedUserId } = parseScope(rtRecord.scope);
     const effectiveUserId = rtRecord.user_id || resolvedUserId || null;
 
-    const tokenData = await buildTokenResponse(effectiveUserId, client_id, cleanScope);
+    const tokenData = await buildTokenResponse(effectiveUserId, client_id, scopeFromRt);
     audit(AUDIT_EVENTS.OAUTH_TOKEN, {
       ip, clientId: client_id, grant: 'refresh_token', userId: effectiveUserId,
     });
@@ -854,6 +816,8 @@ const revoke = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/oauth/introspect
+//  FIX 8: When user_id is null (tester token), resolve identity
+//  from api_tester_accounts via client_id lookup.
 // ─────────────────────────────────────────────────────────────
 const introspect = async (req, res) => {
   const { token: tok } = req.body;
@@ -873,16 +837,25 @@ const introspect = async (req, res) => {
     if (record) await supabase.from('oauth_access_tokens').delete().eq('token', tok);
     return res.status(200).json({ active: false });
   }
-  const u = record.users;
+
+  // FIX 8: resolve tester identity when users join returns nothing
+  let u = record.users;
+  if (!u && record.client_id) {
+    u = await resolveTesterByClientId(record.client_id);
+  }
+
+  // FIX 9: strip __uid from scope before returning to caller
+  const visibleScope = cleanScope(record.scope);
+
   return res.status(200).json({
     active:     true,
-    scope:      record.scope,
+    scope:      visibleScope,
     client_id:  record.client_id,
-    username:   u?.email    || null,
+    username:   u?.email      || null,
     token_type: 'Bearer',
     exp: Math.floor(new Date(record.expires_at).getTime() / 1000),
     iat: Math.floor(new Date(record.created_at).getTime() / 1000),
-    sub: record.user_id || 'service-account',
+    sub: record.user_id || u?.id || 'service-account',
     iss: ISSUER,
     role:       u?.role       || 'service',
     name:       u?.name       || null,
